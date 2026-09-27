@@ -370,15 +370,13 @@ async fn dial(
     tls_config: Arc<ClientConfig>,
     client_id: Option<Uuid>,
 ) -> std::io::Result<BoxTransport> {
-    let addr = server
-        .to_socket_addrs()?
-        .next()
-        .ok_or(std::io::Error::other("No socket addresses found"))?;
+    use std::io::Error;
+    let addr = server.to_socket_addrs()?.next().ok_or(Error::other("No socket addresses found"))?;
     let tcp = TcpStream::connect(addr).await?;
     log::info!("connecting to AnyTLS server {server}");
     let name = match sni {
-        Some(sni) => ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?,
-        None => ServerName::try_from(server.host()).map_err(std::io::Error::other)?,
+        Some(sni) => ServerName::try_from(sni.to_owned()).map_err(Error::other)?,
+        None => ServerName::try_from(server.host()).map_err(Error::other)?,
     };
     let connector = TlsConnector::from(tls_config);
     let mut tls = connector.connect(name, tcp).await?;

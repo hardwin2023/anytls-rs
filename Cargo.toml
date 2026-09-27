@@ -1,6 +1,6 @@
 [package]
 name = "anytls"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 authors = ["@ssrlive"]
 description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
@@ -36,7 +36,6 @@ client = [
     "dep:rustls-native-certs",
     "dep:rustls-pemfile",
     "dep:serde",
-    "dep:socks-hub",
     "dep:tokio-rustls",
     "dep:url",
     "tokio/fs",
