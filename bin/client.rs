@@ -254,8 +254,13 @@ fn http_methods() -> &'static [&'static [u8]] {
 
 #[cfg(test)]
 mod listener_tests {
-    use super::{could_be_http_request_prefix, insecure_tls_enabled, is_http_request};
-    use std::path::Path;
+    use super::{could_be_http_request_prefix, insecure_tls_enabled, is_http_request, negotiate_socks5_request};
+    use socks5_impl::server::IncomingConnection;
+    use std::{path::Path, sync::Arc, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
 
     #[test]
     fn root_certificate_forces_secure_tls_even_when_insecure_is_true() {
@@ -278,7 +283,29 @@ mod listener_tests {
         assert!(could_be_http_request_prefix(b"GET"));
         assert!(!could_be_http_request_prefix(b"GARBAGE"));
     }
+
+    #[tokio::test]
+    async fn stalled_socks5_request_times_out_and_closes_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let incoming = IncomingConnection::new(server, Arc::new(super::NoAuth));
+        let negotiation = tokio::spawn(negotiate_socks5_request(incoming, Duration::from_millis(10)));
+
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0x05, 0x00]);
+
+        let error = negotiation.await.unwrap().err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
 }
+
+const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct HttpStreamIo {
     inner: Mutex<StreamIo>,
@@ -298,6 +325,15 @@ impl AsyncRead for HttpStreamIo {
         };
         Pin::new(&mut *inner).poll_read(cx, buf)
     }
+}
+
+async fn negotiate_socks5_request(incoming: IncomingConnection, timeout: std::time::Duration) -> std::io::Result<ClientConnection> {
+    tokio::time::timeout(timeout, async {
+        let authenticated = incoming.authenticate().await.map_err(std::io::Error::other)?;
+        authenticated.wait_request().await.map_err(std::io::Error::other)
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "SOCKS5 handshake timed out"))?
 }
 
 impl AsyncWrite for HttpStreamIo {
@@ -354,8 +390,7 @@ async fn dial(
 }
 
 async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, context: Arc<ProxyConnectionContext>) -> std::io::Result<()> {
-    let authenticated = incoming.authenticate().await.map_err(std::io::Error::other)?;
-    let request = authenticated.wait_request().await.map_err(std::io::Error::other)?;
+    let request = negotiate_socks5_request(incoming, SOCKS_HANDSHAKE_TIMEOUT).await?;
     let (connect, target) = match request {
         ClientConnection::Connect(connect, target) => {
             context.set_target(target.to_string());
