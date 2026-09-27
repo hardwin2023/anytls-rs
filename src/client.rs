@@ -205,9 +205,9 @@ mod tests {
         let mut first = client.create_stream().await.unwrap();
         let session = first.session().unwrap();
         let second = session.open_stream().await.unwrap();
-        assert_eq!(session.id(), second.session_id().unwrap());
+        assert_eq!(session.id(), second.session_id());
         let mut third = client.create_stream().await.unwrap();
-        assert_ne!(session.id(), third.session_id().unwrap());
+        assert_ne!(session.id(), third.session_id());
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
         first.close().await.unwrap();
         tokio::task::yield_now().await;
@@ -255,12 +255,12 @@ mod tests {
         );
 
         let mut first = client.create_stream().await.unwrap();
-        let first_session_id = first.session_id().unwrap();
+        let first_session_id = first.session_id();
         first.close().await.unwrap();
         tokio::task::yield_now().await;
 
         let second = client.create_stream().await.unwrap();
-        assert_ne!(first_session_id, second.session_id().unwrap());
+        assert_ne!(first_session_id, second.session_id());
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
 
         drop(second);

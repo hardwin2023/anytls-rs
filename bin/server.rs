@@ -182,7 +182,7 @@ async fn handle_connection(
         let stream = match session.accept_stream().await {
             Ok(stream) => stream,
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                log::info!("session {session_id}: session closed by peer");
+                log::info!("session {session_id} closed by peer");
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -207,7 +207,7 @@ async fn relay_stream(
     client_id: Option<Uuid>,
     panel_sync_enabled: bool,
 ) -> std::io::Result<()> {
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
     let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);

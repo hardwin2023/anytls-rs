@@ -246,23 +246,25 @@ impl Session {
     pub async fn accept_stream(&self) -> std::io::Result<Stream> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::Unsupported};
         let mut incoming = self.incoming.lock().await;
+        let session_id = self.id();
         let receiver = incoming
             .as_mut()
             .ok_or_else(|| Error::new(Unsupported, "client sessions do not accept streams"))?;
         let stream = tokio::select! {
-            stream = receiver.recv() => stream.ok_or_else(|| Error::new(BrokenPipe, "session closed because of remote closure"))?,
-            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, "session closed because of cancellation")),
+            stream = receiver.recv() => stream.ok_or_else(|| Error::new(BrokenPipe, format!("session {session_id} closed because of remote closure")))?,
+            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, format!("session {session_id} closed because of cancellation"))),
         };
         if stream.is_closed() {
-            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed"));
+            return Err(Error::new(BrokenPipe, format!("session {session_id} stream closed")));
         }
         Ok(stream)
     }
 
     pub async fn open_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
-        use std::io::{Error, ErrorKind::BrokenPipe};
+        use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::WouldBlock};
+        let session_id = self.id();
         if self.is_closed() {
-            return Err(Error::new(BrokenPipe, "session closed"));
+            return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
         let id = self.next_stream_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (local, remote) = tokio::io::duplex(64 * 1024);
@@ -271,10 +273,10 @@ impl Session {
             let mut streams = self.streams.lock().await;
             // Re-check under the streams lock so we cannot insert after shutdown drained.
             if self.is_closed() {
-                return Err(Error::new(BrokenPipe, "session closed"));
+                return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
             }
             if streams.len() >= self.max_streams {
-                return Err(Error::new(std::io::ErrorKind::WouldBlock, "session stream limit reached"));
+                return Err(Error::new(WouldBlock, format!("session {session_id} stream limit reached")));
             }
             streams.insert(id, StreamEntry::new(remote, id, Arc::downgrade(self)));
         }
@@ -284,7 +286,7 @@ impl Session {
         }
         if self.is_closed() {
             self.finish_stream_by_id(id).await;
-            return Err(Error::new(BrokenPipe, "session closed"));
+            return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
 
         Ok(Stream::new(id, Arc::downgrade(self), local))
@@ -367,6 +369,7 @@ impl Session {
 
     async fn enqueue_encoded_with_mode(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe};
+        let session_id = self.id();
         let (result_sender, result_receiver) = oneshot::channel();
         tokio::select! {
             result = self.write_sender.send(WriteRequest {
@@ -374,11 +377,11 @@ impl Session {
                 disable_buffering_after,
                 result: Some(result_sender),
             }) => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, "session closed")),
+            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, format!("session {session_id} closed"))),
         }
         tokio::select! {
             result = result_receiver => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => Err(Error::new(BrokenPipe, "session closed")),
+            _ = self.close_token.cancelled() => Err(Error::new(BrokenPipe, format!("session {session_id} closed"))),
         }
     }
 
@@ -685,6 +688,7 @@ impl Writer {
 pub struct Stream {
     id: u32,
     session: Weak<Session>,
+    session_id: usize,
     reader: Arc<Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
     writer: Arc<Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
     closed: bool,
@@ -694,9 +698,11 @@ pub struct Stream {
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
         let (reader, writer) = tokio::io::split(io);
+        let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
         Self {
             id,
             session,
+            session_id,
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
             closed: false,
@@ -712,10 +718,11 @@ impl Stream {
         self.closed
     }
 
-    pub fn session_id(&self) -> Option<usize> {
-        self.session().map(|s| s.id())
+    pub fn session_id(&self) -> usize {
+        self.session_id
     }
 
+    #[cfg(test)]
     pub(crate) fn session(&self) -> Option<Arc<Session>> {
         self.session.upgrade()
     }
@@ -729,14 +736,20 @@ impl Stream {
         if self.closed {
             return Err(Error::new(BrokenPipe, "stream closed"));
         }
-        let session = self.session.upgrade().ok_or_else(|| Error::new(BrokenPipe, "session closed"))?;
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| Error::new(BrokenPipe, format!("session {} closed", self.session_id)))?;
         session.write_data(self.id, data).await
     }
 
     pub async fn handshake_success(&self) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let session = self.session.upgrade().ok_or_else(|| Error::new(BrokenPipe, "session closed"))?;
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| Error::new(BrokenPipe, format!("session {} closed", self.session_id)))?;
         if session.peer_version.load(Acquire) >= 2 && self.handshake_reported.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
             session.write_control(Frame::new(Command::SynAck, self.id)).await?;
         }
@@ -746,7 +759,10 @@ impl Stream {
     pub async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let session = self.session.upgrade().ok_or_else(|| Error::new(BrokenPipe, "session closed"))?;
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| Error::new(BrokenPipe, format!("session {} closed", self.session_id)))?;
         if session.peer_version.load(Acquire) >= 2 && self.handshake_reported.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
             let mut frame = Frame::new(Command::SynAck, self.id);
             frame.data = error.as_bytes().to_vec();
@@ -763,7 +779,7 @@ impl Stream {
         self.closed = true;
         let close_result = match self.session.upgrade() {
             Some(session) => session.close_stream_by_id(self.id).await,
-            None => Err(Error::new(BrokenPipe, "session closed")),
+            None => Err(Error::new(BrokenPipe, format!("session {} closed", self.session_id))),
         };
         let shutdown_result = self.writer.lock().await.shutdown().await;
         close_result.and(shutdown_result)
@@ -773,7 +789,7 @@ impl Stream {
         use std::io::{Error, ErrorKind::BrokenPipe};
         match self.session.upgrade() {
             Some(session) => session.send_fin_by_id(self.id).await,
-            None => Err(Error::new(BrokenPipe, "session closed")),
+            None => Err(Error::new(BrokenPipe, format!("session {} closed", self.session_id))),
         }
     }
 }
