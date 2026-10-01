@@ -134,6 +134,11 @@ impl Session {
         max_streams: usize,
         incoming: Option<(mpsc::Sender<Stream>, mpsc::Receiver<Stream>)>,
     ) -> Self {
+        log::trace!(
+            "{} -- Creating new {} session with id: {session_id}",
+            crate::function_name!(),
+            if is_client { "client" } else { "server" }
+        );
         let (reader, writer) = tokio::io::split(transport);
         let incoming_sender = incoming.as_ref().map(|(sender, _)| sender.clone());
         let close_token = CancellationToken::new();
@@ -281,11 +286,11 @@ impl Session {
             streams.insert(id, StreamEntry::new(remote, id, Arc::downgrade(self)));
         }
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Syn, id), true).await {
-            self.finish_stream_by_id(id).await;
+            self.remove_stream_by_id(id).await;
             return Err(error);
         }
         if self.is_closed() {
-            self.finish_stream_by_id(id).await;
+            self.remove_stream_by_id(id).await;
             return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
 
@@ -302,7 +307,7 @@ impl Session {
         if !can_write {
             return Err(Error::new(BrokenPipe, format!("stream {stream_id} closed")));
         }
-        self.enqueue_encoded(bytes, false).await?;
+        self.enqueue_bytes(bytes, false).await?;
         Ok(data.len())
     }
 
@@ -319,25 +324,28 @@ impl Session {
             stream.local_fin = true;
             stream.remote_fin
         };
-        self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await?;
+        self.enqueue_fin(stream_id).await?;
         if remote_fin {
             self.finish_stream_if_closed(stream_id).await;
         }
         Ok(())
     }
 
+    async fn enqueue_fin(&self, stream_id: u32) -> std::io::Result<()> {
+        self.write_control(Frame::new(Command::Fin, stream_id)).await
+    }
+
     pub(crate) async fn close_stream_by_id(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
-        use std::io::ErrorKind::BrokenPipe;
         if self.is_closed() {
             return Ok(());
         }
-        if let Err(error) = self.send_fin_by_id(stream_id).await {
-            self.finish_stream_by_id(stream_id).await;
-            if error.kind() != BrokenPipe {
-                return Err(error);
-            }
+        let result = self.send_fin_by_id(stream_id).await;
+        self.remove_stream_by_id(stream_id).await;
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(error);
         }
-        self.finish_stream_by_id(stream_id).await;
         Ok(())
     }
 
@@ -363,7 +371,7 @@ impl Session {
         self.enqueue_encoded_with_mode(frame.encode()?, disable_buffering_after).await
     }
 
-    async fn enqueue_encoded(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
+    async fn enqueue_bytes(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
         self.enqueue_encoded_with_mode(bytes, disable_buffering_after).await
     }
 
@@ -377,11 +385,11 @@ impl Session {
                 disable_buffering_after,
                 result: Some(result_sender),
             }) => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, format!("session {session_id} closed"))),
+            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode"))),
         }
         tokio::select! {
             result = result_receiver => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => Err(Error::new(BrokenPipe, format!("session {session_id} closed"))),
+            _ = self.close_token.cancelled() => Err(Error::new(BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode (result_receiver)"))),
         }
     }
 
@@ -423,7 +431,7 @@ impl Session {
                         log::debug!("Push worker closed for session {session_id} stream {stream_id}; closing stream");
                         if !self.is_closed() {
                             self.send_fin_before_finish(stream_id).await;
-                            self.finish_stream_by_id(stream_id).await;
+                            self.remove_stream_by_id(stream_id).await;
                         }
                     }
                 }
@@ -433,7 +441,7 @@ impl Session {
                 Command::Settings => self.on_receive_settings(&frame.data).await?,
                 Command::SynAck => {
                     if !frame.data.is_empty() {
-                        self.finish_stream_by_id(stream_id).await;
+                        self.remove_stream_by_id(stream_id).await;
                         let info = String::from_utf8_lossy(&frame.data);
                         log::warn!("Received SynAck with unexpected data for session {session_id} stream {stream_id}, error: {info}");
                     }
@@ -531,11 +539,11 @@ impl Session {
             .get(&stream_id)
             .is_some_and(|stream| stream.local_fin && stream.remote_fin && stream.read_closed);
         if should_finish {
-            self.finish_stream_by_id(stream_id).await;
+            self.remove_stream_by_id(stream_id).await;
         }
     }
 
-    async fn drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+    async fn helper_drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let session_id = self.id();
         let should_send_fin = {
             let mut streams = self.streams.lock().await;
@@ -547,26 +555,30 @@ impl Session {
                 Some(_) | None => false,
             }
         };
-        if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
-            log::warn!("Session {session_id}: Failed to send FIN for stream {stream_id}: {e}");
+        if should_send_fin && let Err(error) = self.enqueue_fin(stream_id).await {
+            log::warn!("Session {session_id}: Failed to send FIN for stream {stream_id}: {error}");
         }
-        self.finish_stream_by_id(stream_id).await;
+        self.remove_stream_by_id(stream_id).await;
     }
 
     async fn send_fin_before_finish(&self, stream_id: u32) {
         let session_id = self.id();
-        if let Err(error) = self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await {
+        if let Err(error) = self.enqueue_fin(stream_id).await {
             log::warn!("Session {session_id}: Failed to queue FIN for stream {stream_id}: {error}");
         }
     }
 
-    async fn finish_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+    /// Finish the stream identified by `stream_id` by removing it from the active streams and dropping its resources.
+    /// If this was the last active stream, mark the session as idle.
+    async fn remove_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+        let function_name = crate::function_name!();
         let session_id = self.id();
         let became_idle = {
             let mut streams = self.streams.lock().await;
             if let Some(entry) = streams.remove(&stream_id) {
                 drop(entry.writer);
                 entry.close_token.cancel();
+                log::trace!("{function_name} -- Stream {stream_id} removed in session {session_id}");
             }
             streams.is_empty()
         };
@@ -576,8 +588,9 @@ impl Session {
             if let Some(sender) = sender
                 && let Err(e) = sender.send(Arc::clone(self))
             {
-                log::warn!("Session {session_id}: Failed to send idle session: {e}");
+                log::warn!("{function_name} -- Failed to send session {session_id} to idle sessions pool: {e}");
             }
+            log::trace!("{function_name} -- Session {session_id} became idle.");
         }
     }
 
@@ -619,10 +632,10 @@ impl Session {
                 let mut rejection = Frame::new(Command::SynAck, stream_id);
                 rejection.data = b"incoming stream queue is full".to_vec();
                 self.enqueue_frame(rejection, false).await?;
-                self.finish_stream_by_id(stream_id).await;
+                self.remove_stream_by_id(stream_id).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.finish_stream_by_id(stream_id).await;
+                self.remove_stream_by_id(stream_id).await;
                 return Err(Error::new(BrokenPipe, "stream receiver closed"));
             }
         }
@@ -697,6 +710,8 @@ pub struct Stream {
 
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
+        let function_name = crate::function_name!();
+        log::trace!("{function_name} -- Creating new stream with id: {id}");
         let (reader, writer) = tokio::io::split(io);
         let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
         Self {
@@ -734,12 +749,13 @@ impl Stream {
     pub async fn write(&self, data: &[u8]) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         if self.closed {
-            return Err(Error::new(BrokenPipe, "stream closed"));
+            log::debug!("Stream {} is closed, can't write data", self.id);
+            return Err(Error::new(BrokenPipe, format!("stream {} closed, can't write data", self.id)));
         }
         let session = self
             .session
             .upgrade()
-            .ok_or_else(|| Error::new(BrokenPipe, format!("session {} closed", self.session_id)))?;
+            .ok_or_else(|| Error::new(BrokenPipe, format!("session {} closed, can't write data", self.session_id)))?;
         session.write_data(self.id, data).await
     }
 
@@ -779,7 +795,7 @@ impl Stream {
         self.closed = true;
         let close_result = match self.session.upgrade() {
             Some(session) => session.close_stream_by_id(self.id).await,
-            None => Err(Error::new(BrokenPipe, format!("session {} closed", self.session_id))),
+            None => Err(Error::new(BrokenPipe, format!("session {} closed already", self.session_id))),
         };
         let shutdown_result = self.writer.lock().await.shutdown().await;
         close_result.and(shutdown_result)
@@ -796,18 +812,27 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        let id = self.id;
+        let session_id = self.session_id;
+        let function_name = crate::function_name!();
+
+        log::trace!("{function_name} -- Dropping stream {id} of session {session_id}...");
         if self.closed {
+            log::debug!("{function_name} -- Stream {id} of session {session_id} already closed, skipping drop it.");
             return;
         }
         self.closed = true;
 
         let Some(session) = self.session.upgrade() else {
+            log::debug!(
+                "{function_name} -- Stream {id}: Session {session_id} already closed but stream lifecycle not complete yet, skipping drop."
+            );
             return;
         };
-        let id = self.id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                session.drop_stream_by_id(id).await;
+                session.helper_drop_stream_by_id(id).await;
+                log::debug!("{function_name} -- Dropped stream {id} of session {session_id} successfully.");
             });
         }
     }

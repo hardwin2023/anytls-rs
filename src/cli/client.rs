@@ -85,10 +85,8 @@ impl ClientArgs {
         }
 
         if self.server.as_ref().is_none_or(|server| server.port() == 0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Server address is required (use --server or --url)",
-            ));
+            use std::io::{Error, ErrorKind::InvalidInput};
+            return Err(Error::new(InvalidInput, "Server address is required (use --server or --url)"));
         }
         Ok(self)
     }

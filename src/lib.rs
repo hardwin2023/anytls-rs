@@ -44,3 +44,30 @@ pub use url_util::{args_json_for_public_ip, format_anytls_url, print_args, print
 
 pub const PROGRAM_VERSION_NAME: &str = concat!("anytls(rust)/", env!("CARGO_PKG_VERSION"));
 pub const PROTOCOL_VERSION: u8 = 2;
+
+/// Helper macro to get the current function name
+#[macro_export]
+#[doc(hidden)]
+macro_rules! function_name {
+    () => {{
+        fn f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        let prefix = concat!(module_path!(), "::");
+        let name = type_name_of(f);
+        let name = name.strip_suffix("::f").unwrap_or(name);
+        let name = name.trim_end_matches("::{{closure}}");
+        if let Some((type_name, trait_and_method)) = name.strip_prefix('<').and_then(|name| name.split_once(" as ")) {
+            match type_name.strip_prefix(prefix) {
+                Some(type_name) => match trait_and_method.rsplit_once(">::") {
+                    Some((_, method_name)) => ::std::borrow::Cow::Owned(format!("{type_name}::{method_name}")),
+                    None => ::std::borrow::Cow::Borrowed(name),
+                },
+                None => ::std::borrow::Cow::Borrowed(name),
+            }
+        } else {
+            ::std::borrow::Cow::Borrowed(name.strip_prefix(prefix).unwrap_or(name))
+        }
+    }};
+}

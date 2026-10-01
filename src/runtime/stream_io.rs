@@ -120,10 +120,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_sends_fin_and_peer_observes_eof() {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let padding = Arc::new(tokio::sync::RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap()));
-        let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 1);
-        let server = Session::new_server(1, Box::new(server_io), padding, 1);
+        let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 8);
+        let server = Session::new_server(10, Box::new(server_io), padding, 8);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -148,8 +149,10 @@ mod tests {
         .expect("peer should observe FIN");
         assert_eq!(received, b"payload");
 
-        peer.write(b"response").await.unwrap();
+        let len = peer.write(b"response").await.unwrap();
+        assert_eq!(len, b"response".len());
         peer.close().await.unwrap();
+
         let mut response = Vec::new();
         tokio::time::timeout(Duration::from_secs(1), io.read_to_end(&mut response))
             .await
