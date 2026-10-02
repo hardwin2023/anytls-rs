@@ -118,7 +118,7 @@ def main():
         print(f'Starting anytls-client on {client_listen} from {CLIENT_BINARY}')
         cl_cmd = [
             str(CLIENT_BINARY),
-            '-l', client_listen,
+            '-l', f'socks5://{client_listen}',
             '-s', server_listen,
             '-p', PASSWORD,
             '--sni', 'localhost',

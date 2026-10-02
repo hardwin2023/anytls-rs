@@ -1,7 +1,7 @@
 use clap::Parser;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use socks5_impl::protocol::Address;
-use std::{net::SocketAddr, path::PathBuf};
+use socks5_impl::protocol::{Address, ProxyParameters, ProxyType};
+use std::path::PathBuf;
 use url::Url;
 use uuid::Uuid;
 
@@ -13,9 +13,9 @@ pub struct ClientArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
-    /// Local address to listen for incoming SOCKS5 and HTTP connections
-    #[arg(short = 'l', long, value_name = "IP:PORT", default_value = "127.0.0.1:1080")]
-    pub listen: SocketAddr,
+    /// Local proxy listen address in the format scheme://host:port, scheme can be mixed, socks5, http, etc.
+    #[arg(short = 'l', long, value_name = "PROXY", default_value = "mixed://127.0.0.1:1080")]
+    pub listen: ProxyParameters,
 
     /// Server address
     #[arg(short = 's', long, value_name = "IP:PORT")]
@@ -84,8 +84,12 @@ impl ClientArgs {
             self.display_name = parsed.display_name;
         }
 
+        use std::io::{Error, ErrorKind::InvalidInput};
+        if !matches!(self.listen.proxy_type, ProxyType::Mixed | ProxyType::Socks5 | ProxyType::Http) {
+            return Err(Error::new(InvalidInput, "Local listener scheme must be mixed, socks5, or http"));
+        }
+
         if self.server.as_ref().is_none_or(|server| server.port() == 0) {
-            use std::io::{Error, ErrorKind::InvalidInput};
             return Err(Error::new(InvalidInput, "Server address is required (use --server or --url)"));
         }
         Ok(self)
@@ -141,7 +145,7 @@ impl Default for ClientArgs {
     fn default() -> Self {
         Self {
             url: None,
-            listen: SocketAddr::from(([127, 0, 0, 1], 1080)),
+            listen: "mixed://127.0.0.1:1080".try_into().unwrap(),
             server: None,
             password: None,
             client_id: None,
@@ -399,5 +403,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.client_id.unwrap().to_string(), "f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7");
+    }
+
+    #[test]
+    fn rejects_unsupported_listener_schemes() {
+        let mut args = ClientArgs::default();
+        args.listen = "socks4://127.0.0.1:1080".try_into().unwrap();
+        assert_eq!(args.resolve().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 }

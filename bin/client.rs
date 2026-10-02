@@ -10,7 +10,7 @@ use rustls::{
 };
 use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
 use socks5_impl::{
-    protocol::{Address, AsyncStreamOperation, Reply},
+    protocol::{Address, AsyncStreamOperation, ProxyType, Reply},
     server::{AssociatedUdpSocket, ClientConnection, IncomingConnection, UdpAssociate, auth::NoAuth, connection::associate},
 };
 use std::{
@@ -37,9 +37,16 @@ async fn main() -> std::io::Result<()> {
     }
     let insecure = insecure_tls_enabled(args.root_cert.as_deref(), args.insecure.unwrap_or(false));
     let client_tls_config = tls_config(args.root_cert.as_deref(), insecure)?;
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let listen_addr = args
+        .listen
+        .addr
+        .as_ref()
+        .ok_or_else(|| Error::new(InvalidInput, "Local proxy listener address is required"))?
+        .to_string();
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    let proxy_type = args.listen.proxy_type;
     let server = args.server.clone().expect("server is validated by ClientArgs::resolve");
-    log::info!("SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}", args.listen, server);
+    log::info!("{} proxy listener started on {}; AnyTLS server {}", proxy_type, listen_addr, server);
     let padding_factory = if let Some(path) = &args.padding_scheme {
         let content = tokio::fs::read(path).await?;
         let factory = PaddingFactory::new(&content)
@@ -87,7 +94,7 @@ async fn main() -> std::io::Result<()> {
         let connector = connector.clone();
         let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
         tokio::spawn(async move {
-            if let Err(error) = handle_listener_stream(stream, client, connector, Arc::clone(&context)).await {
+            if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
                 log::warn!("Proxy connection failed: {}: {error}", context.label());
             }
         });
@@ -96,7 +103,7 @@ async fn main() -> std::io::Result<()> {
 
 struct ProxyConnectionContext {
     peer_addr: Option<SocketAddr>,
-    protocol: Mutex<&'static str>,
+    protocol: Mutex<ProxyType>,
     target: Mutex<Option<String>>,
 }
 
@@ -104,12 +111,12 @@ impl ProxyConnectionContext {
     fn new(peer_addr: Option<SocketAddr>) -> Self {
         Self {
             peer_addr,
-            protocol: Mutex::new("unknown"),
+            protocol: Mutex::new(ProxyType::None),
             target: Mutex::new(None),
         }
     }
 
-    fn set_protocol(&self, protocol: &'static str) {
+    fn set_protocol(&self, protocol: ProxyType) {
         *self.protocol.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = protocol;
     }
 
@@ -129,6 +136,7 @@ async fn handle_listener_stream(
     mut stream: TcpStream,
     client: Arc<Client>,
     connector: HttpConnector,
+    proxy_type: ProxyType,
     context: Arc<ProxyConnectionContext>,
 ) -> std::io::Result<()> {
     let peer_addr = context.peer_addr;
@@ -145,20 +153,33 @@ async fn handle_listener_stream(
             return Ok(());
         }
     };
+    if let Some(protocol) = protocol {
+        context.set_protocol(match protocol {
+            ListenerProtocol::Socks5 => ProxyType::Socks5,
+            ListenerProtocol::Socks4 => ProxyType::Socks4,
+            ListenerProtocol::Http => ProxyType::Http,
+        });
+        if !listener_supports_protocol(&proxy_type, protocol) {
+            log::warn!(
+                "{protocol:?} is not enabled on the {} proxy listener: {}",
+                proxy_type,
+                context.label()
+            );
+            return stream.shutdown().await;
+        }
+    }
+
     match protocol {
         Some(ListenerProtocol::Socks5) => {
-            context.set_protocol("SOCKS5");
             log::trace!("SOCKS5 client detected from {peer_addr:?}");
             let incoming = IncomingConnection::new(stream, Arc::new(NoAuth));
             handle_socks5(incoming, client, context).await
         }
         Some(ListenerProtocol::Socks4) => {
-            context.set_protocol("SOCKS4");
-            log::warn!("SOCKS4 is unsupported on mixed SOCKS5/HTTP listener: {}", context.label());
+            log::warn!("SOCKS4 is unsupported on the mixed SOCKS5/HTTP listener: {}", context.label());
             stream.shutdown().await
         }
         Some(ListenerProtocol::Http) => {
-            context.set_protocol("HTTP");
             log::trace!("HTTP proxy client detected from {peer_addr:?}");
             let request_context = Arc::clone(&context);
             let contextual_connector: HttpConnector = Arc::new(move |destination: Address| {
@@ -168,7 +189,7 @@ async fn handle_listener_stream(
             run_http_service(stream, contextual_connector, UserKey::default()).await
         }
         None => {
-            context.set_protocol("unknown");
+            context.set_protocol(ProxyType::None);
             let mut first_byte = [0u8; 1];
             match stream.peek(&mut first_byte).await {
                 Ok(0) => {
@@ -185,6 +206,15 @@ async fn handle_listener_stream(
             stream.shutdown().await
         }
     }
+}
+
+fn listener_supports_protocol(proxy_type: &ProxyType, protocol: ListenerProtocol) -> bool {
+    matches!(
+        (proxy_type, protocol),
+        (ProxyType::Socks5, ListenerProtocol::Socks5)
+            | (ProxyType::Http, ListenerProtocol::Http)
+            | (ProxyType::Mixed, ListenerProtocol::Socks5 | ListenerProtocol::Http)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,7 +284,11 @@ fn http_methods() -> &'static [&'static [u8]] {
 
 #[cfg(test)]
 mod listener_tests {
-    use super::{could_be_http_request_prefix, insecure_tls_enabled, is_http_request, negotiate_socks5_request};
+    use super::{
+        ListenerProtocol, could_be_http_request_prefix, insecure_tls_enabled, is_http_request, listener_supports_protocol,
+        negotiate_socks5_request,
+    };
+    use socks5_impl::protocol::ProxyType;
     use socks5_impl::server::IncomingConnection;
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio::{
@@ -282,6 +316,17 @@ mod listener_tests {
         assert!(could_be_http_request_prefix(b"CON"));
         assert!(could_be_http_request_prefix(b"GET"));
         assert!(!could_be_http_request_prefix(b"GARBAGE"));
+    }
+
+    #[test]
+    fn listener_scheme_limits_accepted_protocols() {
+        assert!(listener_supports_protocol(&ProxyType::Socks5, ListenerProtocol::Socks5));
+        assert!(!listener_supports_protocol(&ProxyType::Socks5, ListenerProtocol::Http));
+        assert!(listener_supports_protocol(&ProxyType::Http, ListenerProtocol::Http));
+        assert!(!listener_supports_protocol(&ProxyType::Http, ListenerProtocol::Socks5));
+        assert!(listener_supports_protocol(&ProxyType::Mixed, ListenerProtocol::Socks5));
+        assert!(listener_supports_protocol(&ProxyType::Mixed, ListenerProtocol::Http));
+        assert!(!listener_supports_protocol(&ProxyType::Mixed, ListenerProtocol::Socks4));
     }
 
     #[tokio::test]

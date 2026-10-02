@@ -64,7 +64,7 @@ For a deployed server, pass both a certificate and private key.
 
 ### Client
 
-Start a local SOCKS5 + HTTP CONNECT proxy (default listen address: `127.0.0.1:1080`):
+Start a local mixed SOCKS5 + HTTP CONNECT proxy (default listen address: `mixed://127.0.0.1:1080`):
 
 ```bash
 ./anytls-client --server 127.0.0.1:8443 --password your_password --sni localhost --insecure
@@ -90,7 +90,7 @@ See [URI Format](./docs/uri_scheme.md) for escaping, IPv6, and more examples.
 - `-u, --url URL`: AnyTLS URI; supplies the server and can carry password, SNI, TLS mode, client UUID, and display name.
 - `-s, --server IP:PORT`: Server address. Required unless provided by `--url`; the URI's default port is `443`.
 - `-p, --password PASSWORD`: Authentication password. It may instead be placed in the URI authority.
-- `-l, --listen IP:PORT`: Local mixed SOCKS5/HTTP listener [default: `127.0.0.1:1080`].
+- `-l, --listen PROXY`: Local proxy listener as `mixed://HOST:PORT`, `socks5://HOST:PORT`, or `http://HOST:PORT` [default: `mixed://127.0.0.1:1080`].
 - `    --sni DOMAIN`: TLS server name; defaults to the server host.
 - `    --root-cert FILE`: Root certificate PEM file(s) used instead of the system root store to verify the server.
 - `    --insecure [true|false]`: Skip normal server certificate verification. Prefer a trusted certificate or `--root-cert` when possible.
@@ -131,7 +131,7 @@ The server's `--print-args` and `--print-url` options need outbound access to a 
 2. Start client:
 
    ```bash
-   ./anytls-client -l 127.0.0.1:1080 -s 127.0.0.1:8443 -p mysecret --sni localhost --insecure
+   ./anytls-client -l mixed://127.0.0.1:1080 -s 127.0.0.1:8443 -p mysecret --sni localhost --insecure
    ```
 
 3. Configure your browser or application to use SOCKS5 or HTTP CONNECT at `127.0.0.1:1080`.

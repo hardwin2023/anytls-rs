@@ -156,7 +156,7 @@ def main():
         '--password', 'testpass',
         '--sni', 'localhost',
         '--root-cert', str(CERT),
-        '--listen', f'127.0.0.1:{socks_port}',
+        '--listen', f'socks5://127.0.0.1:{socks_port}',
         '--log', LOG_LEVEL,
     ], stdout_path=str(client_log))
 
