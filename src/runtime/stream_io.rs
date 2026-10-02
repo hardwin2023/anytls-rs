@@ -120,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_sends_fin_and_peer_observes_eof() {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let padding = Arc::new(tokio::sync::RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap()));
         let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 8);

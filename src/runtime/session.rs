@@ -15,24 +15,6 @@ pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionReset
 }
 
-struct Writer {
-    transport: tokio::io::WriteHalf<BoxTransport>,
-
-    /// Client Settings and SYN are buffered until the initial SYN write request
-    /// disables buffering, then flushed before subsequent data frames.
-    buffering: bool,
-
-    /// Buffer frames that have not yet been truly written to the underlying connection.
-    buffered: Vec<u8>,
-
-    /// Indicates whether padding still needs to be sent.
-    /// Once the padding scheme's termination condition is met, this is set to false, and subsequent frames are sent directly without padding.
-    send_padding: bool,
-
-    /// Records the number of logical writes, used to select the padding record size.
-    packet_counter: Arc<std::sync::atomic::AtomicU32>,
-}
-
 struct WriteRequest {
     bytes: Vec<u8>,
     disable_buffering_after: bool,
@@ -61,21 +43,33 @@ impl StreamState {
         let close_token = CancellationToken::new();
         let task_close_token = close_token.clone();
         tokio::spawn(async move {
-            while let Some(data) = push_receiver.recv().await {
-                let Some(data) = data else {
+            let result = loop {
+                let message = tokio::select! {
+                    message = push_receiver.recv() => message,
+                    _ = task_close_token.cancelled() => break Ok(()),
+                };
+                let Some(message) = message else {
+                    break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "push_receiver closed"));
+                };
+                let Some(data) = message else {
                     let _ = task_writer.lock().await.shutdown().await;
                     if let Some(session) = session.upgrade() {
                         session.on_stream_read_closed(stream_id).await;
                     }
-                    break;
+                    break Ok(());
                 };
                 let result = tokio::select! {
                     result = async { task_writer.lock().await.write_all(&data).await } => result,
-                    _ = task_close_token.cancelled() => break,
+                    _ = task_close_token.cancelled() => break Ok(()),
                 };
-                if result.is_err() {
-                    break;
+                if let Err(e) = result {
+                    break Err(e);
                 }
+            };
+            if let Err(e) = result {
+                log::warn!("{} -- Stream task encountered an error: {}", crate::function_name!(), e);
+            } else {
+                log::trace!("{} -- Stream task completed successfully", crate::function_name!());
             }
         });
         Self {
@@ -245,6 +239,8 @@ impl Session {
         Ok(())
     }
 
+    /// Accepts an incoming stream from the session.
+    /// It's used by the server to receive streams initiated by the client.
     pub async fn accept_stream(&self) -> std::io::Result<Stream> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::Unsupported};
         let mut incoming = self.incoming.lock().await;
@@ -262,6 +258,8 @@ impl Session {
         Ok(stream)
     }
 
+    /// Opens a new outgoing stream in the session.
+    /// It's used by the client to initiate streams to the server.
     pub async fn open_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::WouldBlock};
         let session_id = self.id();
@@ -639,6 +637,24 @@ impl Session {
         }
         Ok(())
     }
+}
+
+struct Writer {
+    transport: tokio::io::WriteHalf<BoxTransport>,
+
+    /// Client Settings and SYN are buffered until the initial SYN write request
+    /// disables buffering, then flushed before subsequent data frames.
+    buffering: bool,
+
+    /// Buffer frames that have not yet been truly written to the underlying connection.
+    buffered: Vec<u8>,
+
+    /// Indicates whether padding still needs to be sent.
+    /// Once the padding scheme's termination condition is met, this is set to false, and subsequent frames are sent directly without padding.
+    send_padding: bool,
+
+    /// Records the number of logical writes, used to select the padding record size.
+    packet_counter: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Writer {
