@@ -510,13 +510,13 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     let outer_address: Vec<u8> = uot_sentinel_destination().into();
     let request: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
     if let Err(error) = write_stream_all(&proxy_stream, &outer_address).await {
-        let _ = proxy_stream.shutdown_write().await;
+        let _ = proxy_stream.shutdown_write_by_send_fin_to_remote().await;
         let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
         reply.shutdown().await?;
         return Err(error);
     }
     if let Err(error) = write_stream_all(&proxy_stream, &request).await {
-        let _ = proxy_stream.shutdown_write().await;
+        let _ = proxy_stream.shutdown_write_by_send_fin_to_remote().await;
         let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
         reply.shutdown().await?;
         return Err(error);
@@ -573,7 +573,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     .await;
 
     reader_task.abort();
-    let _ = proxy_stream.shutdown_write().await;
+    let _ = proxy_stream.shutdown_write_by_send_fin_to_remote().await;
     let _ = control.shutdown().await;
     result
 }

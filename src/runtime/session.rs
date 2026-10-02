@@ -40,7 +40,7 @@ struct WriteRequest {
 }
 
 /// Represents an status of a logical stream within a session.
-pub(crate) struct StreamEntry {
+pub(crate) struct StreamState {
     pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
     pub(crate) push_sender: mpsc::UnboundedSender<Option<Vec<u8>>>,
     /// Indicates whether the local side has sent a FIN for this stream.
@@ -53,7 +53,7 @@ pub(crate) struct StreamEntry {
     pub(crate) close_token: CancellationToken,
 }
 
-impl StreamEntry {
+impl StreamState {
     pub(crate) fn new(writer: tokio::io::DuplexStream, stream_id: u32, session: Weak<Session>) -> Self {
         let (push_sender, mut push_receiver) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
         let writer = Arc::new(Mutex::new(writer));
@@ -94,7 +94,7 @@ pub struct Session {
     created_at: std::time::Instant,
     max_streams: usize,
     write_sender: mpsc::Sender<WriteRequest>,
-    streams: Mutex<HashMap<u32, StreamEntry>>,
+    streams: Mutex<HashMap<u32, StreamState>>,
     next_stream_id: std::sync::atomic::AtomicU32,
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -134,11 +134,8 @@ impl Session {
         max_streams: usize,
         incoming: Option<(mpsc::Sender<Stream>, mpsc::Receiver<Stream>)>,
     ) -> Self {
-        log::trace!(
-            "{} -- Creating new {} session with id: {session_id}",
-            crate::function_name!(),
-            if is_client { "client" } else { "server" }
-        );
+        let side = if is_client { "client" } else { "server" };
+        log::trace!("{} -- Creating {side} session {session_id}", crate::function_name!());
         let (reader, writer) = tokio::io::split(transport);
         let incoming_sender = incoming.as_ref().map(|(sender, _)| sender.clone());
         let close_token = CancellationToken::new();
@@ -283,7 +280,7 @@ impl Session {
             if streams.len() >= self.max_streams {
                 return Err(Error::new(WouldBlock, format!("session {session_id} stream limit reached")));
             }
-            streams.insert(id, StreamEntry::new(remote, id, Arc::downgrade(self)));
+            streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
         }
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Syn, id), true).await {
             self.remove_stream_by_id(id).await;
@@ -578,7 +575,8 @@ impl Session {
             if let Some(entry) = streams.remove(&stream_id) {
                 drop(entry.writer);
                 entry.close_token.cancel();
-                log::trace!("{function_name} -- Stream {stream_id} removed in session {session_id}");
+                let l = streams.len();
+                log::trace!("{function_name} -- Stream {stream_id} removed in session {session_id}, remaining streams: {l}");
             }
             streams.is_empty()
         };
@@ -615,7 +613,7 @@ impl Session {
             if streams.len() >= self.max_streams {
                 reject = true;
             } else {
-                streams.insert(stream_id, StreamEntry::new(remote, stream_id, Arc::downgrade(self)));
+                streams.insert(stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self)));
             }
         }
         if reject {
@@ -711,9 +709,9 @@ pub struct Stream {
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
         let function_name = crate::function_name!();
-        log::trace!("{function_name} -- Creating new stream with id: {id}");
         let (reader, writer) = tokio::io::split(io);
         let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
+        log::trace!("{function_name} -- Creating stream {id} in session {session_id}");
         Self {
             id,
             session,
@@ -801,11 +799,12 @@ impl Stream {
         close_result.and(shutdown_result)
     }
 
-    pub async fn shutdown_write(&self) -> std::io::Result<()> {
+    pub async fn shutdown_write_by_send_fin_to_remote(&self) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe};
+        let session_id = self.session_id;
         match self.session.upgrade() {
             Some(session) => session.send_fin_by_id(self.id).await,
-            None => Err(Error::new(BrokenPipe, format!("session {} closed", self.session_id))),
+            None => Err(Error::new(BrokenPipe, format!("can't send FIN for session {session_id} closed"))),
         }
     }
 }

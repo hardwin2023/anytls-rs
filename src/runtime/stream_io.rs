@@ -96,7 +96,7 @@ impl AsyncWrite for StreamIo {
         }
         if self.shutdown_future.is_none() {
             let stream = Arc::clone(&self.stream);
-            self.shutdown_future = Some(Box::pin(async move { stream.shutdown_write().await }));
+            self.shutdown_future = Some(Box::pin(async move { stream.shutdown_write_by_send_fin_to_remote().await }));
         }
         match self.shutdown_future.as_mut().expect("shutdown future installed").as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
