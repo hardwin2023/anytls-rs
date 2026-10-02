@@ -1,5 +1,5 @@
 use anytls::{
-    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay,
+    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, function_name, relay,
     uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
 use clap::Parser;
@@ -14,7 +14,7 @@ use socks5_impl::{
     server::{AssociatedUdpSocket, ClientConnection, IncomingConnection, UdpAssociate, auth::NoAuth, connection::associate},
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let func_name = function_name!();
     use std::io::{Error, ErrorKind::InvalidInput};
     let args = ClientArgs::parse().resolve()?;
     let default_log_filter = args.log.as_str().to_ascii_lowercase();
@@ -46,12 +47,12 @@ async fn main() -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     let proxy_type = args.listen.proxy_type;
     let server = args.server.clone().expect("server is validated by ClientArgs::resolve");
-    log::info!("{} proxy listener started on {}; AnyTLS server {}", proxy_type, listen_addr, server);
+    log::info!("{func_name} -- {proxy_type} proxy listener started on {listen_addr}; AnyTLS server {server}");
     let padding_factory = if let Some(path) = &args.padding_scheme {
         let content = tokio::fs::read(path).await?;
         let factory = PaddingFactory::new(&content)
             .ok_or_else(|| Error::new(InvalidInput, format!("Wrong format padding scheme file: {}", path.display())))?;
-        log::info!("Loaded padding scheme file: {}", path.display());
+        log::info!("{func_name} -- Loaded padding scheme file: {}", path.display());
         factory
     } else {
         PaddingFactory::new(DEFAULT_SCHEME).expect("default padding")
@@ -95,7 +96,7 @@ async fn main() -> std::io::Result<()> {
         let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
         tokio::spawn(async move {
             if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
-                log::warn!("Proxy connection failed: {}: {error}", context.label());
+                log::warn!("{} -- Proxy connection failed: {}: {error}", function_name!(), context.label());
             }
         });
     }
@@ -139,16 +140,18 @@ async fn handle_listener_stream(
     proxy_type: ProxyType,
     context: Arc<ProxyConnectionContext>,
 ) -> std::io::Result<()> {
+    let f_n = function_name!();
+    let c_l = context.label();
     let peer_addr = context.peer_addr;
     let protocol = match tokio::time::timeout(std::time::Duration::from_secs(5), detect_listener_protocol(&stream)).await {
         Ok(Ok(protocol)) => protocol,
         Ok(Err(error)) if relay::is_peer_disconnect(&error) => {
-            log::debug!("Proxy peer disconnected during protocol detection: {}: {error}", context.label());
+            log::debug!("{f_n} -- Proxy peer disconnected during protocol detection: {c_l}: {error}");
             return Ok(());
         }
         Ok(Err(error)) => return Err(error),
         Err(_) => {
-            log::debug!("Timed out detecting proxy protocol from {peer_addr:?}");
+            log::debug!("{f_n} -- Timed out detecting proxy protocol from {peer_addr:?}");
             stream.shutdown().await?;
             return Ok(());
         }
@@ -160,27 +163,23 @@ async fn handle_listener_stream(
             ListenerProtocol::Http => ProxyType::Http,
         });
         if !listener_supports_protocol(&proxy_type, protocol) {
-            log::warn!(
-                "{protocol:?} is not enabled on the {} proxy listener: {}",
-                proxy_type,
-                context.label()
-            );
+            log::warn!("{protocol:?} is not enabled on the {proxy_type} proxy listener: {c_l}");
             return stream.shutdown().await;
         }
     }
 
     match protocol {
         Some(ListenerProtocol::Socks5) => {
-            log::trace!("SOCKS5 client detected from {peer_addr:?}");
+            log::trace!("{f_n} -- SOCKS5 client detected from {peer_addr:?}");
             let incoming = IncomingConnection::new(stream, Arc::new(NoAuth));
             handle_socks5(incoming, client, context).await
         }
         Some(ListenerProtocol::Socks4) => {
-            log::warn!("SOCKS4 is unsupported on the mixed SOCKS5/HTTP listener: {}", context.label());
+            log::warn!("{f_n} -- SOCKS4 is unsupported on the mixed SOCKS5/HTTP listener: {c_l}");
             stream.shutdown().await
         }
         Some(ListenerProtocol::Http) => {
-            log::trace!("HTTP proxy client detected from {peer_addr:?}");
+            log::trace!("{f_n} -- HTTP proxy client detected from {peer_addr:?}");
             let request_context = Arc::clone(&context);
             let contextual_connector: HttpConnector = Arc::new(move |destination: Address| {
                 request_context.set_target(destination.to_string());
@@ -193,12 +192,12 @@ async fn handle_listener_stream(
             let mut first_byte = [0u8; 1];
             match stream.peek(&mut first_byte).await {
                 Ok(0) => {
-                    log::debug!("Proxy peer closed before sending a request: {}", context.label());
+                    log::debug!("{f_n} -- Proxy peer closed before sending a request: {c_l}");
                     return Ok(());
                 }
-                Ok(_) => log::warn!("Unknown proxy protocol: {}, first byte: 0x{:02x}", context.label(), first_byte[0]),
+                Ok(_) => log::warn!("{f_n} -- Unknown proxy protocol: {c_l}, first byte: 0x{:02x}", first_byte[0]),
                 Err(error) if relay::is_peer_disconnect(&error) => {
-                    log::debug!("Proxy peer disconnected before sending a request: {}: {error}", context.label());
+                    log::debug!("{f_n} -- Proxy peer disconnected before sending a request: {c_l}: {error}");
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -415,24 +414,26 @@ async fn dial(
     tls_config: Arc<ClientConfig>,
     client_id: Option<Uuid>,
 ) -> std::io::Result<BoxTransport> {
+    let f_n = function_name!();
     use std::io::Error;
-    let addr = server.to_socket_addrs()?.next().ok_or(Error::other("No socket addresses found"))?;
-    let tcp = TcpStream::connect(addr).await?;
-    log::info!("connecting to AnyTLS server {server}");
+    let addresses = tokio::net::lookup_host(server.to_string()).await?.collect::<Vec<_>>();
+    let tcp = TcpStream::connect(&addresses[..]).await?;
+    log::trace!("{f_n} -- connecting to AnyTLS server {server}");
     let name = match sni {
         Some(sni) => ServerName::try_from(sni.to_owned()).map_err(Error::other)?,
         None => ServerName::try_from(server.host()).map_err(Error::other)?,
     };
     let connector = TlsConnector::from(tls_config);
     let mut tls = connector.connect(name, tcp).await?;
-    log::info!("TLS connection to AnyTLS server {server} established");
-    let padding = padding.read().await;
+    log::trace!("{f_n} -- TLS connection to AnyTLS server {server} established");
+    let padding = padding.read().await.clone();
     write_auth_with_client_id(&mut tls, password, &padding, client_id).await?;
-    log::info!("AnyTLS authentication to {server} completed");
+    log::trace!("{f_n} -- AnyTLS authentication to {server} completed");
     Ok(Box::new(tls))
 }
 
 async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, context: Arc<ProxyConnectionContext>) -> std::io::Result<()> {
+    let f_n = function_name!();
     let request = negotiate_socks5_request(incoming, SOCKS_HANDSHAKE_TIMEOUT).await?;
     let (connect, target) = match request {
         ClientConnection::Connect(connect, target) => {
@@ -450,14 +451,14 @@ async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, contex
         }
     };
     let started = std::time::Instant::now();
-    log::info!("opening SOCKS5 CONNECT to {target}");
+    log::trace!("{f_n} -- opening SOCKS5 CONNECT to {target}");
     let stream = client.create_stream().await?;
     let mut remote = StreamIo::new(stream);
     target.write_to_async_stream(&mut remote).await?;
     let mut ready = match connect.reply(Reply::Succeeded, Address::unspecified()).await {
         Ok(ready) => ready,
         Err(error) if relay::is_peer_disconnect(&error) => {
-            log::debug!("Proxy peer disconnected before SOCKS5 reply: {}: {error}", context.label());
+            log::debug!("{f_n} -- Proxy peer disconnected before SOCKS5 reply: {}: {error}", context.label());
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -465,15 +466,15 @@ async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, contex
     let (client_to_proxy, proxy_to_client) = match relay::copy_bidirectional(&mut ready, &mut remote).await {
         Ok(counts) => counts,
         Err(error) if error.is_peer_disconnect() => {
-            log::debug!("Proxy peer disconnected during SOCKS5 relay: {}: {error}", context.label());
+            log::debug!("{f_n} -- Proxy peer disconnected during SOCKS5 relay: {}: {error}", context.label());
             return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
     ready.shutdown().await?;
     remote.shutdown().await?;
-    log::info!(
-        "SOCKS5 relay to {target} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
+    log::trace!(
+        "{f_n} -- SOCKS5 relay to {target} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
         started.elapsed()
     );
     Ok(())
@@ -590,6 +591,7 @@ async fn write_stream_all(stream: &Stream, mut bytes: &[u8]) -> std::io::Result<
 }
 
 fn tls_config(root_cert: Option<&Path>, insecure: bool) -> std::io::Result<Arc<ClientConfig>> {
+    let f_n = function_name!();
     if insecure {
         let mut config = ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
@@ -608,7 +610,7 @@ fn tls_config(root_cert: Option<&Path>, insecure: bool) -> std::io::Result<Arc<C
     } else {
         let cert_result = rustls_native_certs::load_native_certs();
         if !cert_result.errors.is_empty() {
-            log::warn!("Failed to load some native certificates: {:?}", cert_result.errors);
+            log::warn!("{f_n} -- Failed to load some native certificates: {:?}", cert_result.errors);
         }
         for cert in cert_result.certs {
             root_store.add(cert).map_err(std::io::Error::other)?;
@@ -616,10 +618,8 @@ fn tls_config(root_cert: Option<&Path>, insecure: bool) -> std::io::Result<Arc<C
     }
 
     if root_store.roots.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "No root certificates available for TLS verification",
-        ));
+        use std::io::{Error, ErrorKind::InvalidInput};
+        return Err(Error::new(InvalidInput, "No root certificates available for TLS verification"));
     }
 
     let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();

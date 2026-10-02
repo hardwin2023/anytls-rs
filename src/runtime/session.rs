@@ -4,12 +4,16 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, runtime::BoxTransport, to_bytes};
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionReset
@@ -96,8 +100,9 @@ pub struct Session {
     peer_version: std::sync::atomic::AtomicU8,
     received_settings: std::sync::atomic::AtomicBool,
     padding: Arc<RwLock<PaddingFactory>>,
-    reader: Mutex<tokio::io::ReadHalf<BoxTransport>>,
+    reader: Mutex<Option<tokio::io::ReadHalf<BoxTransport>>>,
     close_token: CancellationToken,
+    heart_response: Notify,
     incoming: Mutex<Option<mpsc::Receiver<Stream>>>,
     incoming_sender: Option<mpsc::Sender<Stream>>,
     idle_sender: Mutex<Option<mpsc::UnboundedSender<Arc<Session>>>>,
@@ -154,16 +159,22 @@ impl Session {
                     _ = writer_close_token.cancelled() => None,
                 };
                 let Some(request) = request else {
-                    let _ = writer.transport.shutdown().await;
                     break;
                 };
-                let mut result = writer.write_conn(request.bytes, &writer_padding).await.map(|_| ());
-                if result.is_ok() && request.disable_buffering_after {
-                    writer.buffering = false;
-                    if !writer.buffered.is_empty() {
-                        result = writer.write_conn(Vec::new(), &writer_padding).await.map(|_| ());
-                    }
-                }
+                let result = tokio::select! {
+                    biased;
+                    _ = writer_close_token.cancelled() => break,
+                    result = tokio::time::timeout(WRITE_TIMEOUT, async {
+                        writer.write_conn(request.bytes, &writer_padding).await?;
+                        if request.disable_buffering_after {
+                            writer.buffering = false;
+                            if !writer.buffered.is_empty() {
+                                writer.write_conn(Vec::new(), &writer_padding).await?;
+                            }
+                        }
+                        Ok(())
+                    }) => result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS transport write timed out"))),
+                };
                 let failed = result.is_err();
                 if let Some(result_sender) = request.result {
                     let _ = result_sender.send(result);
@@ -171,6 +182,7 @@ impl Session {
                 if failed {
                     writer_closed.store(true, std::sync::atomic::Ordering::Release);
                     writer_close_token.cancel();
+                    break;
                 }
             }
         });
@@ -186,8 +198,9 @@ impl Session {
             peer_version: std::sync::atomic::AtomicU8::new(0),
             received_settings: std::sync::atomic::AtomicBool::new(false),
             padding,
-            reader: Mutex::new(reader),
+            reader: Mutex::new(Some(reader)),
             close_token,
+            heart_response: Notify::new(),
             incoming: Mutex::new(incoming.map(|(_, receiver)| receiver)),
             incoming_sender,
             idle_sender: Mutex::new(None),
@@ -205,6 +218,10 @@ impl Session {
     #[inline]
     pub async fn has_stream_capacity(&self) -> bool {
         self.streams.lock().await.len() < self.max_streams
+    }
+
+    pub(crate) async fn is_idle(&self) -> bool {
+        self.streams.lock().await.is_empty()
     }
 
     pub async fn set_idle_sender(&self, sender: mpsc::UnboundedSender<Arc<Session>>) {
@@ -227,16 +244,62 @@ impl Session {
 
         let session = Arc::clone(self);
         let session_id = self.id();
-        tokio::spawn(async move {
-            let result = Arc::clone(&session).receive_loop().await;
-            match result {
-                Ok(()) => log::debug!("session {session_id} receive loop stopped",),
-                Err(error) => log::warn!("session {session_id} receive loop failed: {error}"),
-            }
-            let _ = session.shutdown().await;
-            log::info!("session {session_id} shut down");
-        });
+        tokio::spawn(Self::do_main_loop_task(session, session_id));
+        if self.is_client {
+            let session = Arc::downgrade(self);
+            let close_token = self.close_token.clone();
+            tokio::spawn(Session::do_heartbeat_task(session, session_id, close_token));
+        }
         Ok(())
+    }
+
+    async fn do_main_loop_task(session: Arc<Session>, session_id: usize) {
+        let function_name = crate::function_name!();
+        let result = Arc::clone(&session).receive_loop().await;
+        match result {
+            Ok(()) => log::debug!("{function_name} -- Session {session_id} receive loop stopped",),
+            Err(error) => log::warn!("{function_name} -- Session {session_id} receive loop failed: {error}"),
+        }
+        let _ = session.shutdown().await;
+        log::debug!("{function_name} -- Session {session_id} shut down");
+    }
+
+    async fn do_heartbeat_task(session: Weak<Session>, session_id: usize, close_token: CancellationToken) {
+        let function_name = crate::function_name!();
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = close_token.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let Some(session) = session.upgrade() else {
+                break;
+            };
+            if session.peer_version.load(std::sync::atomic::Ordering::Acquire) < 2 {
+                continue;
+            }
+            let response = session.heart_response.notified();
+            tokio::pin!(response);
+            response.as_mut().enable();
+            let probe = async {
+                session.write_control(Frame::new(Command::HeartRequest, 0)).await?;
+                response.await;
+                Ok::<(), std::io::Error>(())
+            };
+            let result = tokio::select! {
+                _ = close_token.cancelled() => break,
+                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, probe) => result,
+            };
+            if matches!(result, Ok(Ok(()))) {
+                log::trace!("{function_name} -- Session {session_id} heartbeat succeeded");
+            } else {
+                log::warn!("{function_name} -- Session {session_id} heartbeat failed or timed out; closing stalled transport");
+                let _ = session.shutdown().await;
+                break;
+            }
+        }
     }
 
     /// Accepts an incoming stream from the session.
@@ -261,6 +324,11 @@ impl Session {
     /// Opens a new outgoing stream in the session.
     /// It's used by the client to initiate streams to the server.
     pub async fn open_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
+        let stream = self.reserve_stream().await?;
+        self.open_reserved_stream(stream).await
+    }
+
+    pub(crate) async fn reserve_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::WouldBlock};
         let session_id = self.id();
         if self.is_closed() {
@@ -280,6 +348,13 @@ impl Session {
             }
             streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
         }
+        Ok(Stream::new(id, Arc::downgrade(self), local))
+    }
+
+    pub(crate) async fn open_reserved_stream(self: &Arc<Self>, stream: Stream) -> std::io::Result<Stream> {
+        use std::io::{Error, ErrorKind::BrokenPipe};
+        let session_id = self.id();
+        let id = stream.id();
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Syn, id), true).await {
             self.remove_stream_by_id(id).await;
             return Err(error);
@@ -289,7 +364,7 @@ impl Session {
             return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
 
-        Ok(Stream::new(id, Arc::downgrade(self), local))
+        Ok(stream)
     }
 
     pub(crate) async fn write_data(&self, stream_id: u32, data: &[u8]) -> std::io::Result<usize> {
@@ -347,6 +422,7 @@ impl Session {
     pub async fn shutdown(&self) -> std::io::Result<()> {
         self.closed.store(true, std::sync::atomic::Ordering::Release);
         self.close_token.cancel();
+        self.reader.lock().await.take();
         let streams = self.streams.lock().await.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
         for entry in streams {
             entry.close_token.cancel();
@@ -360,6 +436,20 @@ impl Session {
 
     async fn write_control(&self, frame: Frame) -> std::io::Result<()> {
         self.enqueue_frame(frame, false).await
+    }
+
+    fn queue_control(&self, frame: Frame) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        self.write_sender
+            .try_send(WriteRequest {
+                bytes: frame.encode()?,
+                disable_buffering_after: false,
+                result: None,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::new(ErrorKind::WouldBlock, "AnyTLS control queue is full"),
+                mpsc::error::TrySendError::Closed(_) => Error::new(ErrorKind::BrokenPipe, "AnyTLS writer task closed"),
+            })
     }
 
     async fn enqueue_frame(&self, frame: Frame, disable_buffering_after: bool) -> std::io::Result<()> {
@@ -391,21 +481,26 @@ impl Session {
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
         let session_id = self.id();
+        let func_name = crate::function_name!();
         loop {
             let result = tokio::select! {
                 result = async {
-                    Frame::read_from_or_eof(&mut *self.reader.lock().await).await
+                    let mut reader = self.reader.lock().await;
+                    match reader.as_mut() {
+                        Some(reader) => Frame::read_from_or_eof(reader).await,
+                        None => Ok(None),
+                    }
                 } => result,
                 _ = self.close_token.cancelled() => break Ok(()),
             };
             let frame = match result {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
-                    log::debug!("session {session_id} peer closed transport");
+                    log::debug!("{func_name} -- Session {session_id} peer closed transport");
                     break Ok(());
                 }
                 Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("session {session_id} transport reset: {error}");
+                    log::debug!("{func_name} -- Session {session_id} transport reset: {error}");
                     break Ok(());
                 }
                 Err(error) => break Err(error),
@@ -423,9 +518,9 @@ impl Session {
                     if let Some(push_sender) = push_sender
                         && push_sender.send(Some(frame.data)).is_err()
                     {
-                        log::debug!("Push worker closed for session {session_id} stream {stream_id}; closing stream");
+                        log::debug!("{func_name} -- Session {session_id} stream {stream_id} push worker closed; closing stream");
                         if !self.is_closed() {
-                            self.send_fin_before_finish(stream_id).await;
+                            self.queue_control(Frame::new(Command::Fin, stream_id))?;
                             self.remove_stream_by_id(stream_id).await;
                         }
                     }
@@ -437,17 +532,16 @@ impl Session {
                 Command::SynAck => {
                     if !frame.data.is_empty() {
                         self.remove_stream_by_id(stream_id).await;
-                        let info = String::from_utf8_lossy(&frame.data);
-                        log::warn!("Received SynAck with unexpected data for session {session_id} stream {stream_id}, error: {info}");
+                        let i = String::from_utf8_lossy(&frame.data);
+                        log::warn!("{func_name} -- Session {session_id} stream {stream_id} received SynAck with unexpected data: {i}");
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
                 Command::HeartRequest => {
-                    if let Err(error) = self.enqueue_frame(Frame::new(Command::HeartResponse, stream_id), false).await {
-                        log::warn!("Session {session_id}: Failed to queue heart response: {error}");
-                    }
+                    log::trace!("{func_name} -- Session {session_id}: Received HeartRequest");
+                    self.queue_control(Frame::new(Command::HeartResponse, stream_id))?;
                 }
-                Command::HeartResponse => {}
+                Command::HeartResponse => self.heart_response.notify_waiters(),
                 Command::ServerSettings => {
                     let map = from_bytes(&frame.data);
                     if self.is_client
@@ -464,7 +558,8 @@ impl Session {
                     }
                 }
                 Command::Alert => {
-                    log::warn!("Session {session_id}: Received alert: {}", String::from_utf8_lossy(&frame.data));
+                    let info = String::from_utf8_lossy(&frame.data);
+                    log::warn!("{func_name} -- Session {session_id} received alert: {info}",);
                     break Ok(());
                 }
             }
@@ -472,7 +567,6 @@ impl Session {
     }
 
     async fn on_receive_settings(&self, data: &[u8]) -> std::io::Result<()> {
-        let session_id = self.id();
         if self.is_client {
             return Ok(());
         }
@@ -485,17 +579,13 @@ impl Session {
         if let Some(scheme) = update_scheme {
             let mut update = Frame::new(Command::UpdatePaddingScheme, 0);
             update.data = scheme;
-            if let Err(error) = self.enqueue_frame(update, false).await {
-                log::warn!("Session {session_id}: Failed to queue padding scheme update: {error}");
-            }
+            self.queue_control(update)?;
         }
         if map.get("v").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0) >= 2 {
             self.peer_version.store(2, std::sync::atomic::Ordering::Release);
             let mut settings = Frame::new(Command::ServerSettings, 0);
             settings.data = b"v=2".to_vec();
-            if let Err(error) = self.enqueue_frame(settings, false).await {
-                log::warn!("Session {session_id}: Failed to queue server settings: {error}");
-            }
+            self.queue_control(settings)?;
         }
         Ok(())
     }
@@ -556,15 +646,8 @@ impl Session {
         self.remove_stream_by_id(stream_id).await;
     }
 
-    async fn send_fin_before_finish(&self, stream_id: u32) {
-        let session_id = self.id();
-        if let Err(error) = self.enqueue_fin(stream_id).await {
-            log::warn!("Session {session_id}: Failed to queue FIN for stream {stream_id}: {error}");
-        }
-    }
-
-    /// Finish the stream identified by `stream_id` by removing it from the active streams and dropping its resources.
-    /// If this was the last active stream, mark the session as idle.
+    /// Finish the stream state identified by `stream_id` by removing it from the container of active stream states and dropping its resources.
+    /// If this was the last active stream state, mark the session as idle.
     async fn remove_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let function_name = crate::function_name!();
         let session_id = self.id();
@@ -598,7 +681,7 @@ impl Session {
         if !self.received_settings.load(std::sync::atomic::Ordering::Acquire) {
             let mut alert = Frame::new(Command::Alert, 0);
             alert.data = b"client did not send its settings".to_vec();
-            self.enqueue_frame(alert, false).await?;
+            self.queue_control(alert)?;
             return Err(Error::new(InvalidData, "settings required before SYN"));
         }
         let (local, remote) = tokio::io::duplex(64 * 1024);
@@ -617,7 +700,7 @@ impl Session {
         if reject {
             let mut rejection = Frame::new(Command::SynAck, stream_id);
             rejection.data = b"session stream limit reached".to_vec();
-            self.enqueue_frame(rejection, false).await?;
+            self.queue_control(rejection)?;
             return Ok(());
         }
         let stream = Stream::new(stream_id, Arc::downgrade(self), local);
@@ -627,7 +710,7 @@ impl Session {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let mut rejection = Frame::new(Command::SynAck, stream_id);
                 rejection.data = b"incoming stream queue is full".to_vec();
-                self.enqueue_frame(rejection, false).await?;
+                self.queue_control(rejection)?;
                 self.remove_stream_by_id(stream_id).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -671,8 +754,10 @@ impl Writer {
         if self.send_padding {
             let packet_counter = self.packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let factory = padding.read().await;
-            if packet_counter < factory.stop {
-                for size in factory.generate_record_payload_sizes(packet_counter) {
+            let sizes = (packet_counter < factory.stop).then(|| factory.generate_record_payload_sizes(packet_counter));
+            drop(factory);
+            if let Some(sizes) = sizes {
+                for size in sizes {
                     if size == CHECK_MARK {
                         if bytes.is_empty() {
                             break;
@@ -854,9 +939,208 @@ impl Drop for Stream {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::DEFAULT_SCHEME;
+
+    #[derive(Default)]
+    pub(crate) struct WriteGate {
+        blocked: std::sync::atomic::AtomicBool,
+        dropped: std::sync::atomic::AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+        pending: Notify,
+    }
+
+    impl WriteGate {
+        pub(crate) fn block(&self) {
+            self.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        pub(crate) fn release(&self) {
+            self.blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        pub(crate) async fn wait_pending(&self) {
+            tokio::time::timeout(Duration::from_secs(1), self.pending.notified()).await.unwrap();
+        }
+    }
+
+    struct GatedTransport {
+        inner: tokio::io::DuplexStream,
+        gate: Arc<WriteGate>,
+    }
+
+    impl Drop for GatedTransport {
+        fn drop(&mut self) {
+            self.gate.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for GatedTransport {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for GatedTransport {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.gate.blocked.load(std::sync::atomic::Ordering::SeqCst) {
+                *self.gate.waker.lock().unwrap() = Some(context.waker().clone());
+                self.gate.pending.notify_one();
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(context, data)
+        }
+
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, context: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, context: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    pub(crate) fn gated_transport() -> (BoxTransport, tokio::io::DuplexStream, Arc<WriteGate>) {
+        let (inner, peer) = tokio::io::duplex(128 * 1024);
+        let gate = Arc::new(WriteGate::default());
+        (
+            Box::new(GatedTransport {
+                inner,
+                gate: Arc::clone(&gate),
+            }),
+            peer,
+            gate,
+        )
+    }
+
+    #[tokio::test]
+    async fn blocked_heart_response_does_not_block_inbound_data() {
+        let (transport, mut peer, gate) = gated_transport();
+        let session = Session::new_client(1, transport, padding(), 1);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        gate.block();
+        peer.write_all(&Frame::new(Command::HeartRequest, 0).encode().unwrap())
+            .await
+            .unwrap();
+        gate.wait_pending().await;
+        let mut push = Frame::new(Command::Push, stream.id());
+        push.data = b"response".to_vec();
+        peer.write_all(&push.encode().unwrap()).await.unwrap();
+        let mut received = [0u8; 8];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut received))
+                .await
+                .unwrap()
+                .unwrap(),
+            8
+        );
+        assert_eq!(&received, b"response");
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_blocked_writer_and_releases_transport() {
+        let (transport, _peer, gate) = gated_transport();
+        let session = Session::new_client(1, transport, padding(), 1);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        gate.block();
+        let write = tokio::spawn(async move { stream.write(b"pending").await });
+        gate.wait_pending().await;
+        session.shutdown().await.unwrap();
+        assert!(write.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must release transport without unblocking the peer");
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_writer_times_out_and_closes_session() {
+        let (transport, _peer, gate) = gated_transport();
+        let session = Session::new_client(1, transport, padding(), 1);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        gate.block();
+        let write = tokio::spawn(async move { stream.write(b"pending").await });
+        gate.wait_pending().await;
+        tokio::time::advance(WRITE_TIMEOUT).await;
+        session.close_token.cancelled().await;
+        assert!(session.is_closed());
+        assert!(write.await.unwrap().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_v2_heartbeat_closes_silent_session() {
+        let (transport, _peer, _gate) = gated_transport();
+        let session = Session::new_client(1, transport, padding(), 1);
+        session.run().await.unwrap();
+        let _stream = session.open_stream().await.unwrap();
+        session.peer_version.store(2, std::sync::atomic::Ordering::Release);
+        tokio::task::yield_now().await;
+        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        session.close_token.cancelled().await;
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn v1_session_does_not_send_proactive_heartbeats() {
+        let (local, mut peer) = tokio::io::duplex(128 * 1024);
+        let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
+        let session = Session::new_client(1, Box::new(local), padding, 1);
+        session.run().await.unwrap();
+        let _stream = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+        tokio::time::advance(HEARTBEAT_INTERVAL * 4).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), Frame::read_from(&mut peer))
+                .await
+                .is_err()
+        );
+        assert!(!session.is_closed());
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_keep_healthy_v2_session_open() {
+        let (local, peer) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(local), padding(), 1);
+        let server = Session::new_server(2, Box::new(peer), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+        let _stream = client.open_stream().await.unwrap();
+        let _peer_stream = server.accept_stream().await.unwrap();
+        for _probe in 0..4 {
+            tokio::time::advance(HEARTBEAT_INTERVAL).await;
+            for _turn in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!client.is_closed());
+            assert!(!server.is_closed());
+        }
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
 
     #[test]
     fn classifies_peer_disconnect_errors() {

@@ -10,7 +10,7 @@ use rustls::{
 };
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::Path,
     pin::Pin,
     sync::{
@@ -207,6 +207,7 @@ async fn relay_stream(
     client_id: Option<Uuid>,
     panel_sync_enabled: bool,
 ) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind::PermissionDenied, ErrorKind::TimedOut};
     let session_id = stream.session_id();
     let stream_id = stream.id();
     let started = std::time::Instant::now();
@@ -220,15 +221,20 @@ async fn relay_stream(
         if !enabled {
             let message = "panel-managed client is disabled";
             stream_io.handshake_failure(message).await?;
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, message));
+            return Err(Error::new(PermissionDenied, message));
         }
     }
     if uot_is_sentinel_destination(&destination) {
         return relay_uot_datagrams(stream_io, traffic_audit, client_id).await;
     }
     log::debug!("session {session_id} stream {stream_id}: connecting to {destination}");
-    let addresses: Vec<SocketAddr> = destination.to_socket_addrs()?.collect();
-    let outbound = match TcpStream::connect(&addresses[..]).await {
+    let connected = tokio::time::timeout(Duration::from_secs(15), async {
+        let addresses = tokio::net::lookup_host(destination.to_string()).await?.collect::<Vec<_>>();
+        TcpStream::connect(&addresses[..]).await
+    })
+    .await
+    .unwrap_or_else(|_| Err(Error::new(TimedOut, "proxy target connection timed out")));
+    let outbound = match connected {
         Ok(outbound) => outbound,
         Err(error) => {
             let _ = stream_io.handshake_failure(&error.to_string()).await;

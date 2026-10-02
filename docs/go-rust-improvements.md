@@ -60,6 +60,20 @@ The Session ID is used as the ordering key for this selection; the smallest Sess
 
 The Rust Client also applies a configurable maximum Session age through `Client::new`. An expired Session is excluded from new-stream selection. Existing logical streams are not interrupted; the Session is allowed to drain, and an idle expired Session is closed by the cleanup path.
 
+## Stalled Connection Recovery
+
+Session selection and logical-stream reservation remain atomic under the Client allocation lock. SYN transport writes happen after that lock is released, so a stalled Session cannot block allocation on another healthy Session.
+
+A separate creation lock prevents duplicate concurrent Session dials. Waiting for this lock and connecting a new Session share a 15-second deadline. Existing Sessions remain available while a new connection is being established.
+
+Transport write requests have a 15-second deadline. A timeout closes the whole Session because a partially written frame cannot safely be resumed on that transport. Session shutdown cancels an in-flight write and releases both transport halves, even when a closed Session remains referenced by the pool.
+
+After a client receives version-2 server settings, it sends a heartbeat every 15 seconds. Each probe has a 10-second deadline covering both transmission and the response. Missing responses close the Session; version-1 peers are not proactively probed. Control replies are queued without waiting for transport writes in the receive loop. A full control queue closes the Session instead of blocking that loop or silently dropping a required reply.
+
+The command-line client and server resolve proxy addresses asynchronously. The server gives destination resolution and TCP connection establishment a combined 15-second deadline and reports failure through SYNACK when supported.
+
+Closing a failed Session interrupts its existing streams. Later requests can establish a new Session; existing TCP streams are not replayed or migrated automatically.
+
 ## Session Reuse Policy
 
 The Rust Client intentionally has no separate `disable_reuse` option. The Go option combines two unrelated policies: it prevents idle Session reuse and also closes the entire Session when the logical stream closes. Rust keeps these responsibilities separate:
