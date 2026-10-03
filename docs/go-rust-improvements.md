@@ -60,6 +60,8 @@ The Session ID is used as the ordering key for this selection; the smallest Sess
 
 The Rust Client also applies a configurable maximum Session age through `Client::new`. An expired Session is excluded from new-stream selection. Existing logical streams are not interrupted; the Session is allowed to drain, and an idle expired Session is closed by the cleanup path.
 
+`Session::new_client` and `Session::new_server` require an explicit maximum age; `DEFAULT_MAX_SESSION_AGE` is one hour, and zero disables age expiration. Once expired, a Session rejects new outgoing and incoming streams, drains active streams, and shuts down when idle.
+
 ## Stalled Connection Recovery
 
 Session selection and logical-stream reservation remain atomic under the Client allocation lock. SYN transport writes happen after that lock is released, so a stalled Session cannot block allocation on another healthy Session.

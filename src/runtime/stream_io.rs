@@ -114,7 +114,7 @@ impl AsyncWrite for StreamIo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_SCHEME, PaddingFactory, Session};
+    use crate::{DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, PaddingFactory, Session};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -123,8 +123,8 @@ mod tests {
         // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let padding = Arc::new(tokio::sync::RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap()));
-        let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 8);
-        let server = Session::new_server(10, Box::new(server_io), padding, 8);
+        let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 8, DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(10, Box::new(server_io), padding, 8, DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 

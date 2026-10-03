@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::{PaddingFactory, Session, Stream, runtime::BoxTransport};
 
-const MAX_IDLE_SESSIONS: usize = 2;
+const MAX_IDLE_SESSIONS: usize = 4;
 const SESSION_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub type Dialer = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<BoxTransport>> + Send>> + Send + Sync>;
@@ -127,7 +127,13 @@ impl Client {
     async fn create_session(self: &Arc<Self>) -> std::io::Result<Arc<Session>> {
         let transport = (self.dialer)().await?;
         let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let session = Session::new_client(sequence, transport, Arc::clone(&self.padding), self.max_streams_per_session);
+        let session = Session::new_client(
+            sequence,
+            transport,
+            Arc::clone(&self.padding),
+            self.max_streams_per_session,
+            self.max_session_age,
+        );
         let (sender, mut receiver) = mpsc::unbounded_channel();
         session.set_idle_sender(sender).await;
         let client = Arc::downgrade(self);
@@ -138,13 +144,21 @@ impl Client {
                 };
                 let _allocation = client.allocation.lock().await;
                 if !session.is_closed() && session.is_idle().await {
+                    let f_n = crate::function_name!();
+                    let session_id = session.id();
+                    if session.is_expired() {
+                        log::info!("{f_n} -- closing expired idle session {session_id}");
+                        let _ = session.shutdown().await;
+                        continue;
+                    }
                     let mut idle = client.idle_pool.lock().await;
                     if !idle.iter().any(|item| item.session.id() == session.id()) {
                         if idle.len() < MAX_IDLE_SESSIONS {
                             idle.push(IdleSession::new(session));
+                            log::trace!("{f_n} -- added idle session {session_id}, total idle: {}", idle.len());
                         } else {
                             drop(idle);
-                            log::info!("closing excess idle session {}", session.id());
+                            log::trace!("{f_n} -- closing excess idle session {session_id}");
                             let _ = session.shutdown().await;
                         }
                     }
@@ -159,7 +173,7 @@ impl Client {
         let mut idle = self.idle_pool.lock().await;
         while let Some((index, _)) = idle.iter().enumerate().min_by_key(|(_, item)| item.session.id()) {
             let item = idle.swap_remove(index);
-            if !item.session.is_closed() && !item.session.is_expired(self.max_session_age) {
+            if !item.session.is_closed() && !item.session.is_expired() {
                 return Some(item.session);
             }
             tokio::spawn(async move { item.session.shutdown().await });
@@ -175,7 +189,7 @@ impl Client {
         };
         let mut candidates = Vec::new();
         for session in sessions {
-            if !session.is_closed() && !session.is_expired(self.max_session_age) && session.has_stream_capacity().await {
+            if !session.is_closed() && !session.is_expired() && session.has_stream_capacity().await {
                 candidates.push(session);
             }
         }
@@ -188,13 +202,15 @@ impl Client {
         let mut idle = self.idle_pool.lock().await;
         let mut retained = Vec::with_capacity(idle.len());
         for item in idle.drain(..) {
-            if item.since < expiration || item.session.is_expired(self.max_session_age) {
+            if item.since < expiration || item.session.is_expired() {
                 let session = item.session;
                 tokio::spawn(async move { session.shutdown().await });
             } else {
                 retained.push(item);
             }
         }
+        let f_n = crate::function_name!();
+        log::trace!("{f_n} -- cleaned up idle sessions, total idle: {}", retained.len());
         *idle = retained;
     }
 }
@@ -202,8 +218,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DEFAULT_SCHEME;
     use crate::runtime::session::tests::gated_transport;
+    use crate::{DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME};
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
@@ -223,6 +239,7 @@ mod tests {
                     Box::new(peer),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                     2,
+                    DEFAULT_MAX_SESSION_AGE,
                 );
                 let servers = Arc::clone(&servers);
                 Box::pin(async move {
@@ -294,6 +311,7 @@ mod tests {
                         Box::new(peer),
                         Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                         1,
+                        DEFAULT_MAX_SESSION_AGE,
                     );
                     server.run().await?;
                     servers.lock().await.push(server);
@@ -370,6 +388,7 @@ mod tests {
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                     2,
+                    DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
                 server_sessions.lock().await.push(server);
@@ -422,6 +441,7 @@ mod tests {
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                     1,
+                    DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
                 server_sessions.lock().await.push(server);
@@ -433,11 +453,12 @@ mod tests {
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
             1,
-            Duration::from_nanos(1),
+            Duration::from_millis(30),
         );
 
         let mut first = client.create_stream().await.unwrap();
         let first_session_id = first.session_id();
+        tokio::time::sleep(Duration::from_millis(40)).await;
         first.close().await.unwrap();
         tokio::task::yield_now().await;
 
@@ -448,6 +469,52 @@ mod tests {
         drop(second);
         for server in server_sessions.lock().await.drain(..) {
             let _ = server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_closed_instead_of_entering_idle_pool() {
+        let server_sessions = Arc::new(Mutex::new(Vec::new()));
+        let servers_for_dialer = Arc::clone(&server_sessions);
+        let dialer: Dialer = Arc::new(move || {
+            let servers = Arc::clone(&servers_for_dialer);
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+                let server = Session::new_server(
+                    1,
+                    Box::new(server_io),
+                    Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+                    1,
+                    DEFAULT_MAX_SESSION_AGE,
+                );
+                server.run().await?;
+                servers.lock().await.push(server);
+                Ok(Box::new(client_io) as BoxTransport)
+            })
+        });
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(60),
+            1,
+            Duration::from_millis(30),
+        );
+
+        let mut stream = client.create_stream().await.unwrap();
+        let session = stream.session().unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        stream.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !session.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired session should shut down as soon as its last stream closes");
+        assert!(client.idle_pool.lock().await.is_empty());
+
+        for server in server_sessions.lock().await.drain(..) {
+            server.shutdown().await.unwrap();
         }
     }
 
@@ -468,6 +535,7 @@ mod tests {
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                     16,
+                    DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
                 server_sessions.lock().await.push(server);
@@ -527,6 +595,7 @@ mod tests {
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
                     128,
+                    DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
                 server_sessions.lock().await.push(server);

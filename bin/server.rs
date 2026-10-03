@@ -1,7 +1,8 @@
 use anytls::{
-    AUTH_HEADER_SIZE, BoxTransport, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, PanelSyncClient, ServerArgs, Session, Stream,
-    StreamIo, TrafficAudit, TrafficAuditPtr, UotMode, extract_client_id_from_padding, is_peer_disconnect, password_digest, print_args,
-    print_url, relay, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
+    AUTH_HEADER_SIZE, BoxTransport, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, PanelSyncClient,
+    ServerArgs, Session, Stream, StreamIo, TrafficAudit, TrafficAuditPtr, UotMode, extract_client_id_from_padding, is_peer_disconnect,
+    password_digest, print_args, print_url, relay, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream,
+    uot_is_sentinel_destination,
 };
 use clap::Parser;
 use rustls::{
@@ -176,7 +177,13 @@ async fn handle_connection(
     }
     log::info!("session {session_id}: TLS and AnyTLS authentication completed for {client_id:?}");
 
-    let session = Session::new_server(session_id, Box::new(tls) as BoxTransport, padding, max_streams);
+    let session = Session::new_server(
+        session_id,
+        Box::new(tls) as BoxTransport,
+        padding,
+        max_streams,
+        DEFAULT_MAX_SESSION_AGE,
+    );
     session.run().await?;
     loop {
         let stream = match session.accept_stream().await {
@@ -219,8 +226,8 @@ async fn relay_stream(
             None => false,
         };
         if !enabled {
-            let message = "panel-managed client is disabled";
-            stream_io.handshake_failure(message).await?;
+            let message = format!("panel-managed client {client_id:?} is disabled");
+            stream_io.handshake_failure(&message).await?;
             return Err(Error::new(PermissionDenied, message));
         }
     }
@@ -233,7 +240,7 @@ async fn relay_stream(
         TcpStream::connect(&addresses[..]).await
     })
     .await
-    .unwrap_or_else(|_| Err(Error::new(TimedOut, "proxy target connection timed out")));
+    .unwrap_or_else(|_| Err(Error::new(TimedOut, format!("proxy target connection to {destination} timed out"))));
     let outbound = match connected {
         Ok(outbound) => outbound,
         Err(error) => {
