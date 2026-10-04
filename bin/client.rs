@@ -1,8 +1,9 @@
 use anytls::{
-    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, function_name, relay,
+    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay,
     uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
 use clap::Parser;
+use method_name::method_name_unstable;
 use rustls::{
     ClientConfig,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -44,12 +45,12 @@ async fn main() -> std::io::Result<()> {
             client.await
         }
     };
-    log::info!("{} -- Client exited with result: {:?}", function_name!(), res);
+    log::info!("{} -- Client exited with result: {:?}", method_name_unstable!(), res);
     res
 }
 
 async fn run_client(cancel_token: CancellationToken) -> std::io::Result<()> {
-    let func_name = function_name!();
+    let func_name = method_name_unstable!();
     use std::io::{Error, ErrorKind::InvalidInput};
     let args = ClientArgs::parse().resolve()?;
     let default_log_filter = args.log.as_str().to_ascii_lowercase();
@@ -125,13 +126,13 @@ async fn run_client(cancel_token: CancellationToken) -> std::io::Result<()> {
                 let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
                 connection_tasks.spawn(async move {
                     if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
-                        log::warn!("{} -- Proxy connection failed: {}: {error}", function_name!(), context.label());
+                        log::warn!("{} -- Proxy connection failed: {}: {error}", method_name_unstable!(), context.label());
                     }
                 });
             }
             Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 if let Err(error) = result {
-                    log::warn!("{} -- Proxy connection task failed: {error}", function_name!());
+                    log::warn!("{} -- Proxy connection task failed: {error}", method_name_unstable!());
                 }
             }
         }
@@ -142,7 +143,8 @@ async fn run_client(cancel_token: CancellationToken) -> std::io::Result<()> {
         let drain = async {
             while let Some(result) = connection_tasks.join_next().await {
                 if let Err(error) = result {
-                    log::warn!("{} -- Proxy connection task failed during shutdown: {error}", function_name!());
+                    let f_n = method_name_unstable!();
+                    log::warn!("{f_n} -- Proxy connection task failed during shutdown: {error}");
                 }
             }
         };
@@ -196,7 +198,7 @@ async fn handle_listener_stream(
     proxy_type: ProxyType,
     context: Arc<ProxyConnectionContext>,
 ) -> std::io::Result<()> {
-    let f_n = function_name!();
+    let f_n = method_name_unstable!();
     let c_l = context.label();
     let peer_addr = context.peer_addr;
     let protocol = match tokio::time::timeout(std::time::Duration::from_secs(5), detect_listener_protocol(&stream)).await {
@@ -470,7 +472,7 @@ async fn dial(
     tls_config: Arc<ClientConfig>,
     client_id: Option<Uuid>,
 ) -> std::io::Result<BoxTransport> {
-    let f_n = function_name!();
+    let f_n = method_name_unstable!();
     use std::io::Error;
     let addresses = tokio::net::lookup_host(server.to_string()).await?.collect::<Vec<_>>();
     let tcp = TcpStream::connect(&addresses[..]).await?;
@@ -489,7 +491,7 @@ async fn dial(
 }
 
 async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, context: Arc<ProxyConnectionContext>) -> std::io::Result<()> {
-    let f_n = function_name!();
+    let f_n = method_name_unstable!();
     let request = negotiate_socks5_request(incoming, SOCKS_HANDSHAKE_TIMEOUT).await?;
     let (connect, target) = match request {
         ClientConnection::Connect(connect, target) => {
@@ -647,7 +649,7 @@ async fn write_stream_all(stream: &Stream, mut bytes: &[u8]) -> std::io::Result<
 }
 
 fn tls_config(root_cert: Option<&Path>, insecure: bool) -> std::io::Result<Arc<ClientConfig>> {
-    let f_n = function_name!();
+    let f_n = method_name_unstable!();
     if insecure {
         let mut config = ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())

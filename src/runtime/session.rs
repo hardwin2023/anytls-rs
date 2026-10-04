@@ -1,3 +1,4 @@
+use method_name::method_name_unstable;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -9,7 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, function_name, runtime::BoxTransport, to_bytes};
+use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, runtime::BoxTransport, to_bytes};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -97,7 +98,7 @@ impl StreamState {
                 break Err(e);
             }
         };
-        let f_n = crate::function_name!();
+        let f_n = method_name_unstable!();
         if let Err(e) = result {
             log::warn!("{f_n} -- Session {session_id} stream {stream_id} task encountered an error: {e}");
         } else {
@@ -160,7 +161,7 @@ impl Session {
         incoming: Option<(mpsc::Sender<Stream>, mpsc::Receiver<Stream>)>,
     ) -> Self {
         let side = if is_client { "client" } else { "server" };
-        log::trace!("{} -- Creating {side} session {session_id}", crate::function_name!());
+        log::trace!("{} -- Creating {side} session {session_id}", method_name_unstable!());
         let (reader, writer) = tokio::io::split(transport);
         let incoming_sender = incoming.as_ref().map(|(sender, _)| sender.clone());
         let close_token = CancellationToken::new();
@@ -305,7 +306,7 @@ impl Session {
     }
 
     async fn do_main_loop_task(session: Arc<Session>, session_id: usize) {
-        let function_name = crate::function_name!();
+        let function_name = method_name_unstable!();
         let result = Arc::clone(&session).receive_loop().await;
         match result {
             Ok(()) => log::debug!("{function_name} -- Session {session_id} receive loop stopped",),
@@ -316,7 +317,7 @@ impl Session {
     }
 
     async fn do_heartbeat_task(session: Weak<Session>, session_id: usize, close_token: CancellationToken) {
-        let function_name = crate::function_name!();
+        let function_name = method_name_unstable!();
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
@@ -362,7 +363,7 @@ impl Session {
         if let Some(session) = session.upgrade()
             && session.is_idle().await
         {
-            let function_name = crate::function_name!();
+            let function_name = method_name_unstable!();
             log::debug!("{function_name} -- Session {session_id} reached its maximum age while idle; closing");
             let _ = session.shutdown().await;
         }
@@ -416,7 +417,7 @@ impl Session {
                 return Err(Error::new(WouldBlock, format!("session {session_id} stream limit reached")));
             }
             streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
-            let f_n = function_name!();
+            let f_n = method_name_unstable!();
             let l = streams.len();
             log::debug!("{f_n} -- session {session_id} reserved stream {id}, total streams: {l}",);
         }
@@ -553,7 +554,7 @@ impl Session {
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
         let session_id = self.id();
-        let func_name = crate::function_name!();
+        let func_name = method_name_unstable!();
         loop {
             let result = tokio::select! {
                 result = async {
@@ -721,7 +722,7 @@ impl Session {
     /// Finish the stream state identified by `stream_id` by removing it from the container of active stream states and dropping its resources.
     /// If this was the last active stream state, mark the session as idle.
     async fn remove_stream_by_id(self: &Arc<Self>, stream_id: u32) {
-        let function_name = crate::function_name!();
+        let function_name = method_name_unstable!();
         let session_id = self.id();
         let became_idle = {
             let mut streams = self.streams.lock().await;
@@ -774,7 +775,7 @@ impl Session {
                 rejection = Some("session stream limit reached");
             } else {
                 streams.insert(stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self)));
-                let f_n = function_name!();
+                let f_n = method_name_unstable!();
                 let l = streams.len();
                 log::debug!("{f_n} -- session {} accepted new stream {stream_id}, total streams: {l}", self.id(),);
             }
@@ -892,7 +893,7 @@ pub struct Stream {
 
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
-        let function_name = crate::function_name!();
+        let function_name = method_name_unstable!();
         let (reader, writer) = tokio::io::split(io);
         let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
         log::trace!("{function_name} -- Creating stream {id} in session {session_id}");
@@ -997,7 +998,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let id = self.id;
         let session_id = self.session_id;
-        let function_name = crate::function_name!();
+        let function_name = method_name_unstable!();
 
         log::trace!("{function_name} -- Dropping stream {id} of session {session_id}...");
         if self.closed {

@@ -1,3 +1,4 @@
+use method_name::method_name_unstable;
 use std::{
     future::Future,
     pin::Pin,
@@ -168,7 +169,7 @@ impl Client {
                     break;
                 }
                 if !session.is_closed() && session.is_idle().await {
-                    let f_n = crate::function_name!();
+                    let f_n = method_name_unstable!();
                     let session_id = session.id();
                     if session.is_expired() {
                         log::info!("{f_n} -- closing expired idle session {session_id}");
@@ -263,7 +264,7 @@ impl Client {
                 retained.push(item);
             }
         }
-        let f_n = crate::function_name!();
+        let f_n = method_name_unstable!();
         log::trace!("{f_n} -- cleaned up idle sessions, total idle: {}", retained.len());
         *idle = retained;
     }
