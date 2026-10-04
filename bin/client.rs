@@ -23,10 +23,32 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let ctrlc = ctrlc2::AsyncCtrlC::new(move || {
+        cancel_token_clone.cancel();
+        true
+    })?;
+
+    let client = run_client(cancel_token);
+    tokio::pin!(client);
+    let res = tokio::select! {
+        result = &mut client => result,
+        result = ctrlc => {
+            result?;
+            client.await
+        }
+    };
+    log::info!("{} -- Client exited with result: {:?}", function_name!(), res);
+    res
+}
+
+async fn run_client(cancel_token: CancellationToken) -> std::io::Result<()> {
     let func_name = function_name!();
     use std::io::{Error, ErrorKind::InvalidInput};
     let args = ClientArgs::parse().resolve()?;
@@ -89,17 +111,51 @@ async fn main() -> std::io::Result<()> {
         })
     });
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let client = client.clone();
-        let connector = connector.clone();
-        let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
-        tokio::spawn(async move {
-            if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
-                log::warn!("{} -- Proxy connection failed: {}: {error}", function_name!(), context.label());
+    let mut connection_tasks = tokio::task::JoinSet::new();
+    let accept_result = loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break Ok(()),
+            result = listener.accept() => {
+                let (stream, _) = match result {
+                    Ok(connection) => connection,
+                    Err(error) => break Err(error),
+                };
+                let client = client.clone();
+                let connector = connector.clone();
+                let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
+                connection_tasks.spawn(async move {
+                    if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
+                        log::warn!("{} -- Proxy connection failed: {}: {error}", function_name!(), context.label());
+                    }
+                });
             }
-        });
+            Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Err(error) = result {
+                    log::warn!("{} -- Proxy connection task failed: {error}", function_name!());
+                }
+            }
+        }
+    };
+
+    let cleanup_result = async {
+        let shutdown_result = client.shutdown().await;
+        let drain = async {
+            while let Some(result) = connection_tasks.join_next().await {
+                if let Err(error) = result {
+                    log::warn!("{} -- Proxy connection task failed during shutdown: {error}", function_name!());
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), drain).await.is_err() {
+            connection_tasks.abort_all();
+            while connection_tasks.join_next().await.is_some() {}
+        }
+        shutdown_result
     }
+    .await;
+
+    accept_result?;
+    cleanup_result
 }
 
 struct ProxyConnectionContext {

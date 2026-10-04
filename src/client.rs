@@ -35,6 +35,7 @@ pub struct Client {
     creation: Mutex<()>,
     idle_pool: Mutex<Vec<IdleSession>>,
     sessions: Mutex<Vec<std::sync::Weak<Session>>>,
+    shutting_down: std::sync::atomic::AtomicBool,
     next_sequence: std::sync::atomic::AtomicUsize,
     max_streams_per_session: usize,
     max_session_age: Duration,
@@ -55,6 +56,7 @@ impl Client {
             creation: Mutex::new(()),
             idle_pool: Mutex::new(Vec::new()),
             sessions: Mutex::new(Vec::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             next_sequence: std::sync::atomic::AtomicUsize::new(0),
             max_streams_per_session: max_streams_per_session.max(1),
             max_session_age,
@@ -75,6 +77,7 @@ impl Client {
     }
 
     pub async fn create_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
+        self.ensure_running()?;
         let (session, stream) = match self.reserve_pooled_stream().await? {
             Some(reserved) => reserved,
             None => {
@@ -89,6 +92,11 @@ impl Client {
                             .await
                             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS session connection timed out"))??;
                         let _allocation = self.allocation.lock().await;
+                        if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(_allocation);
+                            let _ = session.shutdown().await;
+                            return Err(self.shutting_down_error());
+                        }
                         let stream = session.reserve_stream().await?;
                         self.sessions.lock().await.push(Arc::downgrade(&session));
                         (session, stream)
@@ -105,8 +113,21 @@ impl Client {
         }
     }
 
+    fn ensure_running(&self) -> std::io::Result<()> {
+        if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+            Err(self.shutting_down_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn shutting_down_error(&self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "AnyTLS client is shutting down")
+    }
+
     async fn reserve_pooled_stream(&self) -> std::io::Result<Option<(Arc<Session>, Stream)>> {
         let _allocation = self.allocation.lock().await;
+        self.ensure_running()?;
         loop {
             let session = match self.take_idle().await {
                 Some(session) => Some(session),
@@ -143,6 +164,9 @@ impl Client {
                     break;
                 };
                 let _allocation = client.allocation.lock().await;
+                if client.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 if !session.is_closed() && session.is_idle().await {
                     let f_n = crate::function_name!();
                     let session_id = session.id();
@@ -194,6 +218,36 @@ impl Client {
             }
         }
         candidates.into_iter().min_by_key(|session| session.id())
+    }
+
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        self.shutting_down.store(true, std::sync::atomic::Ordering::Release);
+        let _allocation = self.allocation.lock().await;
+        let mut sessions = {
+            let mut registered = self.sessions.lock().await;
+            registered.retain(|session| session.strong_count() > 0);
+            registered.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
+        };
+        let idle_sessions = self.idle_pool.lock().await.drain(..).map(|idle| idle.session).collect::<Vec<_>>();
+        for session in idle_sessions {
+            if !sessions.iter().any(|registered| Arc::ptr_eq(registered, &session)) {
+                sessions.push(session);
+            }
+        }
+        drop(_allocation);
+
+        let mut first_error = None;
+        for session in sessions {
+            if let Err(error) = session.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn cleanup(&self, timeout: Duration) {
@@ -421,6 +475,55 @@ mod tests {
         assert_eq!(client.idle_pool.lock().await.len(), 2);
         for server in server_sessions.lock().await.drain(..) {
             let _ = server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_and_removes_idle_sessions() {
+        let server_sessions = Arc::new(Mutex::new(Vec::new()));
+        let servers_for_dialer = Arc::clone(&server_sessions);
+        let dialer: Dialer = Arc::new(move || {
+            let servers = Arc::clone(&servers_for_dialer);
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+                let server = Session::new_server(
+                    1,
+                    Box::new(server_io),
+                    Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+                    1,
+                    DEFAULT_MAX_SESSION_AGE,
+                );
+                server.run().await?;
+                servers.lock().await.push(Arc::clone(&server));
+                Ok(Box::new(client_io) as BoxTransport)
+            })
+        });
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(60),
+            1,
+            Duration::from_secs(3600),
+        );
+
+        let mut stream = client.create_stream().await.unwrap();
+        let session = stream.session().unwrap();
+        stream.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.idle_pool.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed stream should return its session to the idle pool");
+
+        client.shutdown().await.unwrap();
+
+        assert!(session.is_closed());
+        assert!(client.idle_pool.lock().await.is_empty());
+        assert_eq!(client.create_stream().await.err().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        for server in server_sessions.lock().await.drain(..) {
+            server.shutdown().await.unwrap();
         }
     }
 
