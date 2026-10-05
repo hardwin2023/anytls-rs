@@ -12,7 +12,7 @@ categories = ["network-programming", "command-line-utilities"]
 [[bin]]
 name = "anytls-server"
 path = "bin/server.rs"
-required-features = ["server", "relay"]
+required-features = ["server", "relay", "ctrlc2"]
 
 [[bin]]
 name = "anytls-client"

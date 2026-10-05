@@ -5,6 +5,7 @@ use anytls::{
     uot_is_sentinel_destination,
 };
 use clap::Parser;
+use method_name::method_name_unstable;
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -22,15 +23,38 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::client::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let ctrlc = ctrlc2::AsyncCtrlC::new(move || {
+        cancel_token_clone.cancel();
+        true
+    })?;
+
+    let server = run_server(cancel_token);
+    tokio::pin!(server);
+    let res = tokio::select! {
+        result = &mut server => result,
+        result = ctrlc => {
+            result?;
+            server.await
+        }
+    };
+    log::info!("{} -- Server exited with result: {:?}", method_name_unstable!(), res);
+    res
+}
+
+async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
     let args = ServerArgs::parse();
     let log_level = args.log.to_string().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
@@ -53,11 +77,13 @@ async fn main() -> std::io::Result<()> {
     let panel_config = args.panel_sync_config()?;
     let panel_sync_enabled = panel_config.is_some();
     let traffic_audit: TrafficAuditPtr = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
+    let mut panel_task: Option<JoinHandle<()>> = None;
     if let Some(config) = panel_config {
         let mut panel_client = PanelSyncClient::new(config);
         panel_client.sync_initial(&traffic_audit).await?;
         let audit = Arc::clone(&traffic_audit);
-        tokio::spawn(async move { panel_client.run(audit).await });
+        let panel_cancel_token = cancel_token.clone();
+        panel_task = Some(tokio::spawn(async move { panel_client.run(audit, panel_cancel_token).await }));
     }
     let padding_factory = if let Some(path) = &args.padding_scheme {
         let content = tokio::fs::read(path).await?;
@@ -68,54 +94,89 @@ async fn main() -> std::io::Result<()> {
         PaddingFactory::new(DEFAULT_SCHEME).expect("default scheme is valid")
     };
     let listener = TcpListener::bind(args.listen).await?;
-    log::info!("AnyTLS server listening on {}", args.listen);
+    log::info!("{} -- AnyTLS server listening on {}", method_name_unstable!(), args.listen);
     let padding = Arc::new(tokio::sync::RwLock::new(padding_factory));
     let password = Arc::new(args.password.clone().unwrap_or_default());
     let mut session_id = 0usize;
     let mut last_emfile_warning = tokio::time::Instant::now() - Duration::from_secs(5);
-    loop {
-        let (tcp, peer) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(24) => {
-                if last_emfile_warning.elapsed() >= Duration::from_secs(5) {
-                    log::warn!("accept temporarily failed due to exhausted descriptors: {error}");
-                    last_emfile_warning = tokio::time::Instant::now();
+    let mut connection_tasks = JoinSet::new();
+    let accept_result = loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break Ok(()),
+            result = listener.accept() => {
+                let mn = method_name_unstable!();
+                let (tcp, peer) = match result {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(24) => {
+                        if last_emfile_warning.elapsed() >= Duration::from_secs(5) {
+                            log::warn!("{mn} -- accept temporarily failed due to exhausted descriptors: {error}");
+                            last_emfile_warning = tokio::time::Instant::now();
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                };
+                session_id = session_id.wrapping_add(1);
+                let acceptor = acceptor.clone();
+                let padding = padding.clone();
+                let password = password.clone();
+                let max_streams = args.max_streams_per_session;
+                let traffic_audit = Arc::clone(&traffic_audit);
+                let probe_sni_allowlist = Arc::clone(&probe_sni_allowlist);
+                let forward_target = forward_target.clone();
+                let cancel_token = cancel_token.clone();
+                connection_tasks.spawn(async move {
+                    log::trace!("{mn} -- accepted TLS session {session_id} from {peer}");
+                    if let Err(error) = handle_connection(
+                        tcp,
+                        acceptor,
+                        padding,
+                        password,
+                        session_id,
+                        max_streams,
+                        traffic_audit,
+                        panel_sync_enabled,
+                        probe_sni_allowlist,
+                        forward_target,
+                        cancel_token,
+                    )
+                    .await
+                    {
+                        log::warn!("{mn} -- session {session_id} from {peer} failed: {error}");
+                    } else {
+                        log::trace!("{mn} -- session {session_id} from {peer} closed");
+                    }
+                });
+            }
+            Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Err(error) = result {
+                    log::warn!("{} -- server connection task failed: {error}", method_name_unstable!());
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
             }
-            Err(error) => return Err(error),
-        };
-        session_id = session_id.wrapping_add(1);
-        let acceptor = acceptor.clone();
-        let padding = padding.clone();
-        let password = password.clone();
-        let max_streams = args.max_streams_per_session;
-        let traffic_audit = Arc::clone(&traffic_audit);
-        let probe_sni_allowlist = Arc::clone(&probe_sni_allowlist);
-        let forward_target = forward_target.clone();
-        tokio::spawn(async move {
-            log::info!("accepted TLS session {session_id} from {peer}");
-            if let Err(error) = handle_connection(
-                tcp,
-                acceptor,
-                padding,
-                password,
-                session_id,
-                max_streams,
-                traffic_audit,
-                panel_sync_enabled,
-                probe_sni_allowlist,
-                forward_target,
-            )
-            .await
-            {
-                log::warn!("session {session_id} from {peer} failed: {error}");
-            } else {
-                log::info!("session {session_id} from {peer} closed");
-            }
-        });
+        }
+    };
+
+    cancel_token.cancel();
+    if let Some(mut panel_task) = panel_task
+        && tokio::time::timeout(Duration::from_secs(5), &mut panel_task).await.is_err()
+    {
+        panel_task.abort();
+        let _ = panel_task.await;
     }
+    let drain = async {
+        while let Some(result) = connection_tasks.join_next().await {
+            if let Err(error) = result {
+                let mn = method_name_unstable!();
+                log::warn!("{mn} -- server connection task failed during shutdown: {error}");
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(10), drain).await.is_err() {
+        connection_tasks.abort_all();
+        while connection_tasks.join_next().await.is_some() {}
+    }
+    accept_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,40 +191,59 @@ async fn handle_connection(
     panel_sync_enabled: bool,
     probe_sni_allowlist: Arc<Vec<String>>,
     forward_target: Option<Url>,
+    cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut tls = acceptor.accept(tcp).await?;
+    let mut tls = tokio::select! {
+        _ = cancel_token.cancelled() => return Ok(()),
+        result = acceptor.accept(tcp) => result?,
+    };
     let client_addr = tls.get_ref().0.peer_addr()?;
     let probe_target = tls.get_ref().1.server_name().map(str::to_owned);
     let mut auth_data = [0u8; AUTH_HEADER_SIZE];
     let mut auth_bytes_read = 0;
     while auth_bytes_read < auth_data.len() {
-        let bytes_read = tls.read(&mut auth_data[auth_bytes_read..]).await?;
+        let bytes_read = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = tls.read(&mut auth_data[auth_bytes_read..]) => result?,
+        };
         if bytes_read == 0 {
             break;
         }
         auth_bytes_read += bytes_read;
     }
 
+    let mn = method_name_unstable!();
     let authenticated = auth_bytes_read == AUTH_HEADER_SIZE && auth_data[..PASSWORD_DIGEST_SIZE] == password_digest(&password);
     if !authenticated {
         let prefix = auth_data[..auth_bytes_read].to_vec();
         if let Some(target_url) = forward_target.as_ref() {
-            if let Err(error) = relay_forward_stream(client_addr, target_url, tls, prefix).await {
-                log::debug!("forward relay failed for {client_addr}: {error}");
+            let relay_result = tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                result = relay_forward_stream(client_addr, target_url, tls, prefix) => result,
+            };
+            if let Err(error) = relay_result {
+                log::debug!("{mn} -- forward relay failed for {client_addr}: {error}");
             }
         } else if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
-            if let Err(error) = relay_probe_stream(client_addr, target_host, tls, prefix).await {
-                log::debug!("SNI probe relay failed for {client_addr}: {error}");
+            let relay_result = tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                result = relay_probe_stream(client_addr, target_host, tls, prefix) => result,
+            };
+            if let Err(error) = relay_result {
+                log::debug!("{mn} -- SNI probe relay failed for {client_addr}: {error}");
             }
         } else {
-            log::debug!("authentication failed for {client_addr}; no forward target or matching probe SNI");
+            log::debug!("{mn} -- authentication failed for {client_addr}; no forward target or matching probe SNI");
         }
         return Ok(());
     }
 
     let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]) as usize;
     let mut padding_data = vec![0; padding_len];
-    tls.read_exact(&mut padding_data).await?;
+    tokio::select! {
+        _ = cancel_token.cancelled() => return Ok(()),
+        result = async { tls.read_exact(&mut padding_data).await.map(|_| ()) } => result?,
+    }
     let client_id = extract_client_id_from_padding(&padding_data);
     if panel_sync_enabled {
         let approved = match client_id {
@@ -171,11 +251,11 @@ async fn handle_connection(
             None => false,
         };
         if !approved {
-            log::info!("session {session_id}: denied panel-managed client {client_id:?}");
+            log::debug!("{mn} -- session {session_id}: denied panel-managed client {client_id:?}");
             return Ok(());
         }
     }
-    log::info!("session {session_id}: TLS and AnyTLS authentication completed for {client_id:?}");
+    log::debug!("{mn} -- session {session_id}: TLS and AnyTLS authentication completed for {client_id:?}");
 
     let session = Session::new_server(
         session_id,
@@ -185,27 +265,54 @@ async fn handle_connection(
         DEFAULT_MAX_SESSION_AGE,
     );
     session.run().await?;
-    loop {
-        let stream = match session.accept_stream().await {
-            Ok(stream) => stream,
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                log::info!("session {session_id} closed by peer");
-                return Ok(());
+    let mut stream_tasks = JoinSet::new();
+    let session_result = loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break Ok(()),
+            result = session.accept_stream() => {
+                let stream = match result {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                        log::info!("{mn} -- session {session_id} closed by peer");
+                        break Ok(());
+                    }
+                    Err(error) => break Err(error),
+                };
+                let traffic_audit = Arc::clone(&traffic_audit);
+                stream_tasks.spawn(async move {
+                    let stream_id = stream.id();
+                    if let Err(error) = relay_stream(stream, traffic_audit, client_id, panel_sync_enabled).await {
+                        let mn = method_name_unstable!();
+                        if is_peer_disconnect(&error) {
+                            log::debug!("{mn} -- session {session_id} stream {stream_id} peer disconnected: {error}");
+                        } else {
+                            log::warn!("{mn} -- session {session_id} stream {stream_id} relay failed: {error}");
+                        }
+                    }
+                });
             }
-            Err(error) => return Err(error),
-        };
-        let traffic_audit = Arc::clone(&traffic_audit);
-        tokio::spawn(async move {
-            let stream_id = stream.id();
-            if let Err(error) = relay_stream(stream, traffic_audit, client_id, panel_sync_enabled).await {
-                if is_peer_disconnect(&error) {
-                    log::debug!("session {session_id} stream {stream_id} peer disconnected: {error}");
-                } else {
-                    log::warn!("session {session_id} stream {stream_id} relay failed: {error}");
+            Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Err(error) = result {
+                    log::warn!("{mn} -- session {session_id} stream task failed: {error}");
                 }
             }
-        });
+        }
+    };
+
+    let shutdown_result = session.shutdown().await;
+    let drain = async {
+        while let Some(result) = stream_tasks.join_next().await {
+            if let Err(error) = result {
+                log::warn!("{mn} -- session {session_id} stream task failed during shutdown: {error}");
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain).await.is_err() {
+        stream_tasks.abort_all();
+        while stream_tasks.join_next().await.is_some() {}
     }
+    session_result?;
+    shutdown_result
 }
 
 async fn relay_stream(
@@ -234,7 +341,8 @@ async fn relay_stream(
     if uot_is_sentinel_destination(&destination) {
         return relay_uot_datagrams(stream_io, traffic_audit, client_id).await;
     }
-    log::debug!("session {session_id} stream {stream_id}: connecting to {destination}");
+    let mn = method_name_unstable!();
+    log::debug!("{mn} -- session {session_id} stream {stream_id}: connecting to {destination}");
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
         let addresses = tokio::net::lookup_host(destination.to_string()).await?.collect::<Vec<_>>();
         TcpStream::connect(&addresses[..]).await
@@ -265,14 +373,14 @@ async fn relay_stream(
     let _ = outbound.shutdown().await;
     match relay_result {
         Ok(_) => {
-            log::info!(
-                "session {session_id} stream {stream_id}: relay to {destination} closed: stream_to_target={upstream} bytes, target_to_stream={downstream} bytes, elapsed={:?}",
-                started.elapsed()
+            let elapsed = started.elapsed();
+            log::trace!(
+                "{mn} -- session {session_id} stream {stream_id}: relay to {destination} closed: stream_to_target={upstream} bytes, target_to_stream={downstream} bytes, elapsed={elapsed:?}",
             );
             Ok(())
         }
         Err(error) if error.is_peer_disconnect() => {
-            log::debug!("session {session_id} stream {stream_id}: peer disconnected from {destination}: {error}");
+            log::debug!("{mn} -- session {session_id} stream {stream_id}: peer disconnected from {destination}: {error}");
             Ok(())
         }
         Err(error) => Err(error.into()),
@@ -476,7 +584,8 @@ fn create_probe_target_tls_config() -> std::io::Result<Arc<ClientConfig>> {
     let mut root_store = RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();
     if !cert_result.errors.is_empty() {
-        log::warn!("failed to load some system root certificates: {:?}", cert_result.errors);
+        let mn = method_name_unstable!();
+        log::warn!("{mn} -- failed to load some system root certificates: {:?}", cert_result.errors);
     }
     for cert in cert_result.certs {
         root_store.add(cert).map_err(std::io::Error::other)?;
@@ -494,7 +603,8 @@ where
     let connector = TlsConnector::from(create_probe_target_tls_config()?);
     let server_name = target_host.clone().try_into().map_err(std::io::Error::other)?;
     let mut outbound = connector.connect(server_name, tcp).await?;
-    log::info!("SNI probe relay for {client_addr} to {target_host}:443");
+    let mn = method_name_unstable!();
+    log::trace!("{mn} -- SNI probe relay for {client_addr} to {target_host}:443",);
     outbound.write_all(&prefix).await?;
     outbound.flush().await?;
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
@@ -561,7 +671,8 @@ where
             return Err(Error::new(InvalidInput, format!("unsupported forward URL scheme: {scheme}")));
         }
     };
-    log::info!("forward relay for {client_addr} to {host}:{port} ({})", target.scheme());
+    let mn = method_name_unstable!();
+    log::trace!("{mn} -- forward relay for {client_addr} to {host}:{port} ({})", target.scheme());
     outbound.write_all(&prefix).await?;
     outbound.flush().await?;
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;

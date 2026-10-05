@@ -1,6 +1,8 @@
 use super::traffic_audit::TrafficAuditPtr;
+use method_name::method_name_unstable;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -56,17 +58,28 @@ impl PanelSyncClient {
         }
     }
 
-    pub async fn run(mut self, traffic_audit: TrafficAuditPtr) {
+    pub async fn run(mut self, traffic_audit: TrafficAuditPtr, cancel_token: CancellationToken) {
         let interval_secs = self.config.update_interval_secs.max(5);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        interval.tick().await;
+        let mn = method_name_unstable!();
         loop {
-            interval.tick().await;
-            if let Err(error) = self.sync_once(&traffic_audit).await {
-                log::warn!("panel sync failed: {error}");
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = interval.tick() => {}
             }
-            if let Err(error) = self.report_traffic_once(&traffic_audit).await {
-                log::warn!("panel traffic report failed: {error}");
+            let sync_result = tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                result = self.sync_once(&traffic_audit) => result,
+            };
+            if let Err(error) = sync_result {
+                log::warn!("{mn} -- panel sync failed: {error}");
+            }
+            let report_result = tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                result = self.report_traffic_once(&traffic_audit) => result,
+            };
+            if let Err(error) = report_result {
+                log::warn!("{mn} -- panel traffic report failed: {error}");
             }
         }
     }
@@ -86,7 +99,8 @@ impl PanelSyncClient {
                 seen.insert(client_id);
                 audit.sync_client(client_id, user.enable);
             } else {
-                log::warn!("ignored panel user entry with missing or invalid client_id: {user:?}");
+                let mn = method_name_unstable!();
+                log::warn!("{mn} -- ignored panel user entry with missing or invalid client_id: {user:?}");
             }
         }
         let removed = audit.remove_missing_clients(&seen.into_iter().collect::<Vec<_>>());
@@ -134,7 +148,7 @@ impl PanelSyncClient {
             .await
             .map_err(std::io::Error::other)?;
         let result: serde_json::Value = self.parse_payload(response).await?;
-        log::trace!("panel traffic report response: {result:?}");
+        log::trace!("{} -- panel traffic report response: {result:?}", method_name_unstable!());
         self.reported_traffic.extend(current_traffic);
         Ok(())
     }
@@ -172,6 +186,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    use tokio_util::sync::CancellationToken;
     use url::Url;
     use uuid::Uuid;
 
@@ -245,6 +260,26 @@ mod tests {
         client.report_traffic_once(&audit).await.unwrap();
         assert_eq!(client.reported_traffic.get(&client_id), Some(&(11, 22)));
         panel_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn panel_sync_loop_stops_when_cancelled() {
+        let client = PanelSyncClient::new(PanelSyncConfig {
+            webapi_url: Url::parse("http://127.0.0.1:1/").unwrap(),
+            webapi_token: "test-token".to_string(),
+            node_id: 7,
+            update_interval_secs: 60,
+        });
+        let audit = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
+        let cancel_token = CancellationToken::new();
+        let task = tokio::spawn(client.run(audit, cancel_token.clone()));
+
+        cancel_token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("panel sync loop should stop promptly after cancellation")
+            .unwrap();
     }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
